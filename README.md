@@ -16,11 +16,12 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
-| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes, both directions) |
+| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes; parallel shapes within 20 m counted together, so traffic-island splits keep the full count); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
 | `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed) |
 | `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
 | `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
-| `png/bus_network_{full,city_limits}.png` | Subway-style bus network, made by subway_like_map (see below) |
+| `png/bus_network_{city,full}.png` | Bus network diagram (one colour per line, bundled lines), made by subway_like_map with `config/diagram_lines.json` (see below); `city` = zoomed to the city limits, lines not trimmed |
+| `config/diagram_lines.json` | Diagram colours and legend names: every line its own family (`groups` / `names` / `colors`, read by subway_like_map's `--groups`) |
 | `data/qa/shape_legs.csv` | Per stop-to-stop leg: straight-line vs routed distance (shape QA) |
 | `data/cache/` | OSM road graph + Overpass cache (git-ignored, re-downloaded if missing) |
 | `data/validation/` | MobilityData validator report (git-ignored) |
@@ -108,11 +109,13 @@ Other projects are only changed for a reason and with the user's OK; their outpu
   1,817 houses get the walk area within 30 m, as through their front gate) and own colour classes 1..400+ (buildings
   reach at most ~205 departures). Stop check: Brzegowa - Baza (depot) and Ekologiczna gated, Czosnówka 4 ~100 m off
   the walk network; all minor. Rerun after a new feed: `run_city.py ... --from gtfs`.
-- **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): cities `bialapodlaska` and
-  `bialapodlaska_city` (clipped to `data/gis/city_limits.gpkg`); `CITY=<c> python scripts/01_extract_trams.py`, 02, `03 1
-  300000 3`, `04_render.py --poster --dpi 150 --labels key --branch-bullets --stop-scale 0.85 --out png/...`
-  (Python: `D:\QGIS\gtfs_schedules_cityenv`). Draft quality: legend text from the busiest pattern (G and H look
-  alike), station bars at some ordinary stops.
+- **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): city `bialapodlaska`
+  (`bialapodlaska_city` = feed clipped to the city limits, not used any more: the user prefers zooming over
+  trimming). `CITY=bialapodlaska python scripts/01_extract_trams.py`, `02_build_network.py`, `03_order_lines.py 1 300000 3`,
+  then `04_render.py --poster --dpi 150 --labels key --stop-scale 0.8 --spacing 25 --groups
+  D:/QGIS/gtfs_biala_podlaska/config/diagram_lines.json --extent 778420 466330 793200 474790 --out .../png/bus_network_city.png`
+  (full: `--spacing 35`, no `--extent`). Python: `D:\QGIS\gtfs_schedules_cityenv`. The NYC family colours were
+  rejected (2026-11-16): one colour per line, tighter bundles, zoom to the city.
 - The basemap in `data/basemap/` is a copy of `D:\QGIS\osm_basemapialapodlaska` (made by TransitFrequency).
 
 - Next: polish the subway-style map (legend texts, stations), maybe 10-min walk variant; feed expires
