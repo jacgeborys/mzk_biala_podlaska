@@ -48,11 +48,18 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
   trip start. 33 groups of stops sharing a minute are ordered by the shortest path between neighbours.
 - **Times**: arrival = departure = timetable minute, `timepoint=1`.
 - **Shapes**: one per variant (`<line>_<variant>`), map-matched on the OSM `drive_service` network
-  (Viterbi over the 6 nearest edges within 60 m of each stop); one-ways respected. Cost = length × road class
+  (Viterbi over the 12 nearest edges within 60 m of each stop; 6 was too few: at Białka 2 the right carriageway
+  was 8th, behind a frontage road and both directions of side streets); one-ways respected. Cost = length × road class
   weight (`ROAD_WEIGHTS`): primary/secondary/trunk 1.0, tertiary 1.05, unclassified 1.1, residential 1.6,
   service 2.0; `living_street` excluded. Keeps buses on tertiary-or-above roads unless a stop is on a residential
   street (residential 1.1 -> 1.6 changed 69 of 102 shapes, typically +85-145 m; checked: C_j no longer U-turns on
   Jana III Sobieskiego, G_h Brzeska -> Narutowicza now via Al. 1000-lecia instead of a residential street).
+  **Turn penalties**: routing runs on an edge-based graph (node = road edge, arc = edge-to-edge move), each move
+  costs its turn angle: < 20° free, else 60 m × angle/90° (~8-10 s of bus time), >= 150° (U-turn) 200 m. Edge
+  heading is measured over its first/last 15 m so OSM micro-jogs do not count as turns. Fixes zigzags through
+  equal-class side streets: A/F/G/H Sidorska 5 -> Orzechowa 1 now straight up Włoska and left into Orzechowa
+  (was Piaskowa -> Pływacka, 64 m shorter but 3 turns; 20 m per turn was not enough). Also removed U-turn loops
+  at Dworzec PKP, Terebelska Pętla, Terebela, Al. Solidarności (most legs 30-150 m shorter).
   `shape_dist_traveled` in metres in shapes and stop_times. All stops lie within ~31 m of their shape.
 - **Routes**: `route_type=3`, long name from the basic variant, colours assigned arbitrarily (`LINE_COLORS`).
 - Trip notes (`UWAGI_KURS`) are not exported; headsigns come from the variant. Seasonal notes do not affect this
@@ -60,7 +67,8 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 
 ## Status (2026-11-16)
 
-- GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing uses road class weights (residential 1.6), living streets excluded.
+- GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing uses road class weights (residential 1.6),
+  living streets excluded, turn penalties (Włoska / Orzechowa zigzag fixed, checked by the user's local knowledge).
 - Feed built: 13 lines (A–M, T weekends only), 318 posts / 172 stations, 1249 trips, 25 613 stop times, 102 shapes;
   valid 10.11–31.12.2026.
 - MobilityData validator v8.0.1: **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`

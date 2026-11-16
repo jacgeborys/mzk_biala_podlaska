@@ -42,6 +42,13 @@ ROAD_WEIGHTS = {
 }
 DEFAULT_ROAD_WEIGHT = 1.1
 EXCLUDED_ROADS = {"living_street"}
+# Turn penalties (in weighted metres), so routes do not zigzag through side streets
+# when a straighter path of equal length exists
+TURN_FREE_DEG = 20      # heading changes below this are free
+TURN_PENALTY_M = 60     # cost of a 90° turn, linear in angle (~8-10 s of bus time)
+UTURN_DEG = 150
+UTURN_PENALTY_M = 200
+BEARING_SPAN_M = 15     # edge heading measured over this length at each end
 
 # One colour per line, distinct hues (text colour picked for contrast below)
 LINE_COLORS = {
@@ -179,17 +186,73 @@ class Router:
         penalty = classes.map(lambda c: max(ROAD_WEIGHTS.get(x, DEFAULT_ROAD_WEIGHT) for x in c))
         edges["w"] = edges.geometry.length * penalty.values
         self.edges = edges
-        # best parallel edge per (u, v) for path reconstruction
-        best = edges.sort_values("w").drop_duplicates(["u", "v"])
-        self.uv = {(u, v): (w, g) for u, v, w, g in zip(best.u, best.v, best.w, best.geometry)}
-        import networkx as nx
-        self.D = nx.DiGraph()
-        for (u, v), (w, _) in self.uv.items():
-            self.D.add_edge(u, v, w=w)
+        self.u, self.v = edges.u.values, edges.v.values
+        self.len = edges.geometry.length.values
+        self.rate = edges.w.values / np.maximum(self.len, 1e-9)  # cost per metre
+        self._build_turn_graph()
         self.tree = STRtree(list(edges.geometry))
         self.sp_cache = {}
 
-    def candidates(self, pt, k=6, radius=60):
+    def _build_turn_graph(self):
+        """Edge-based graph: node = road edge, arc = moving from one edge onto the next,
+        cost = turn penalty (by angle) + weight of the next edge."""
+        from scipy.sparse import csr_matrix
+        n = len(self.edges)
+        b_in, b_out = np.zeros(n), np.zeros(n)
+        for i, g in enumerate(self.edges.geometry):
+            # heading over the first / last 15 m, so tiny jogs in the geometry do not count as turns
+            d = min(BEARING_SPAN_M, g.length / 2)
+            if d > 0:
+                p0, p1 = g.interpolate(0).coords[0], g.interpolate(d).coords[0]
+                q0, q1 = g.interpolate(g.length - d).coords[0], g.interpolate(g.length).coords[0]
+                b_in[i], b_out[i] = bearing(p0, p1), bearing(q0, q1)
+        by_u = {}
+        for i, u in enumerate(self.u):
+            by_u.setdefault(u, []).append(i)
+        rows, cols, cost = [], [], []
+        for i in range(n):
+            for j in by_u.get(self.v[i], []):
+                rows.append(i)
+                cols.append(j)
+                cost.append(turn_cost(b_out[i], b_in[j]) + self.edges.w.iat[j] + 1e-6)
+        self.TG = csr_matrix((cost, (rows, cols)), shape=(n, n))
+        self.TGc = self.TG.tocsc()
+
+    def sp(self, src):
+        from scipy.sparse.csgraph import dijkstra
+        if src not in self.sp_cache:
+            if len(self.sp_cache) > 600:
+                self.sp_cache.pop(next(iter(self.sp_cache)))
+            self.sp_cache[src] = dijkstra(self.TG, indices=src, return_predecessors=True, limit=15000)
+        return self.sp_cache[src]
+
+    def route(self, a, b):
+        """Cheapest way from the end of edge a to the start of edge b.
+        Returns (cost of turns + edges in between, list of edges in between) or (inf, None)."""
+        dist, pred = self.sp(a)
+        if a == b:  # leave the edge and come back onto it
+            col = slice(self.TGc.indptr[b], self.TGc.indptr[b + 1])
+            best, last = np.inf, None
+            for p, c in zip(self.TGc.indices[col], self.TGc.data[col]):
+                if p != a and dist[p] + c < best:
+                    best, last = dist[p] + c, p
+            if last is None:
+                return np.inf, None
+            x = last
+        else:
+            if not np.isfinite(dist[b]):
+                return np.inf, None
+            best, x = dist[b], pred[b]
+        path = []
+        while x != a:
+            if x < 0:
+                return np.inf, None
+            path.append(x)
+            x = pred[x]
+        path.reverse()
+        return best - self.edges.w.iat[b], path
+
+    def candidates(self, pt, k=12, radius=60):
         idx = self.tree.query(pt.buffer(radius))
         if len(idx) == 0:
             idx = [self.tree.nearest(pt)]
@@ -198,23 +261,6 @@ class Router:
             g = self.edges.geometry.iat[i]
             c.append((g.distance(pt), i, g.project(pt)))
         return sorted(c)[:k]
-
-    def sp(self, src):
-        import networkx as nx
-        if src not in self.sp_cache:
-            self.sp_cache[src] = nx.dijkstra_predecessor_and_distance(self.D, src, cutoff=10000, weight="w")
-        return self.sp_cache[src]
-
-    def path_geom(self, src, dst):
-        pred, _ = self.sp(src)
-        nodes = [dst]
-        while nodes[-1] != src:
-            nodes.append(pred[nodes[-1]][0])
-        nodes.reverse()
-        coords = []
-        for a, b in zip(nodes, nodes[1:]):
-            coords.extend(self.uv[(a, b)][1].coords)
-        return coords
 
     def match(self, pts):
         """pts: list of shapely Points (metric). Returns (coords, dist_at_stop, n_fallback)."""
@@ -230,11 +276,10 @@ class Router:
                 best, arg = np.inf, None
                 for j, (dp, ej, pp) in enumerate(cands[i - 1]):
                     if ej == ei and pos >= pp:
-                        t = pos - pp
+                        t = self.rate[ej] * (pos - pp)
                     else:
-                        _, dist = self.sp(E.v.iat[ej])
-                        net = dist.get(E.u.iat[ei], np.inf)
-                        t = (E.geometry.iat[ej].length - pp) + net + pos
+                        t = (self.rate[ej] * (self.len[ej] - pp) + self.route(ej, ei)[0]
+                             + self.rate[ei] * pos)
                     if score[j] + t < best:
                         best, arg = score[j] + t, j
                 if arg is None:  # unreachable from every previous candidate
@@ -251,15 +296,17 @@ class Router:
         chosen = [cands[i][s] for i, s in enumerate(sel)]
 
         coords, dists, fallback = [], [0.0], 0
-        for (_, ej, pp), (_, ei, pos), pa, pb in zip(chosen, chosen[1:], pts, pts[1:]):
+        for (_, ej, pp), (_, ei, pos) in zip(chosen, chosen[1:]):
             ga, gb = E.geometry.iat[ej], E.geometry.iat[ei]
             if ej == ei and pos >= pp:
                 leg = list(substring(ga, pp, pos).coords)
             else:
-                src, dst = E.v.iat[ej], E.u.iat[ei]
-                if dst in self.sp(src)[1]:
-                    leg = (list(substring(ga, pp, ga.length).coords) + self.path_geom(src, dst)
-                           + list(substring(gb, 0, pos).coords))
+                cost, path = self.route(ej, ei)
+                if path is not None:
+                    leg = list(substring(ga, pp, ga.length).coords)
+                    for e in path:
+                        leg.extend(E.geometry.iat[e].coords)
+                    leg.extend(substring(gb, 0, pos).coords)
                 else:
                     fallback += 1
                     leg = [ga.interpolate(pp).coords[0], gb.interpolate(pos).coords[0]]
@@ -271,6 +318,19 @@ class Router:
             dists.append(dists[-1] + seg_len)
         return coords, dists, fallback
 
+
+def bearing(p, q):
+    return float(np.degrees(np.arctan2(q[0] - p[0], q[1] - p[1])))
+
+
+def turn_cost(b_from, b_to):
+    """Penalty in weighted metres for changing heading from b_from to b_to."""
+    angle = abs((b_to - b_from + 180) % 360 - 180)
+    if angle < TURN_FREE_DEG:
+        return 0.0
+    if angle >= UTURN_DEG:
+        return UTURN_PENALTY_M
+    return TURN_PENALTY_M * angle / 90
 
 def dedupe(c):
     out = []
