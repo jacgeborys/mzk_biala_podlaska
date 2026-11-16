@@ -2,3 +2,5 @@ data/cache/
 data/validation/
 tools/
 __pycache__/
+data/basemap/
+video/*.mp4

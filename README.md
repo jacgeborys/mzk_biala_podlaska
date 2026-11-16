@@ -13,6 +13,9 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `export_gis.py` | GTFS -> GeoPackage + network diagram |
 | `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line) |
 | `png/network_diagram.png` | Quick network diagram (line colours, termini labels, trip counts in legend) |
+| `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
+| `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
+| `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
 | `data/qa/shape_legs.csv` | Per stop-to-stop leg: straight-line vs routed distance (shape QA) |
 | `data/cache/` | OSM road graph + Overpass cache (git-ignored, re-downloaded if missing) |
 | `data/validation/` | MobilityData validator report (git-ignored) |
@@ -24,6 +27,8 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 python convert_to_gtfs.py            # rebuild data/gtfs + data/gtfs.zip
 python convert_to_gtfs.py --no-shapes   # skip OSM routing
 python export_gis.py                 # GeoPackage + diagram (after the conversion)
+python animate_buses.py --still 07:30   # one preview frame
+python animate_buses.py              # video: 18.11.2026 04:30-23:30 in 120 s, 30 fps (~3600 frames)
 java -jar tools/gtfs-validator-cli.jar -i data/gtfs.zip -o data/validation -c pl
 ```
 Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the validator.
@@ -79,6 +84,10 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 - MobilityData validator v8.0.1: **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`
   (loop trips, expected).
 - `agency_url` / `feed_contact_url` = https://mzkbp.pl/ (operator site).
-- Next: plug the feed into TransitFrequency (frequency / accessibility, new `--city`), subway_like_map /
-  transit_scheme (network map) and gtfs_schedules_city (animation). Feed expires 31.12.2026 — analyses must
-  use a date inside that window; a new export will be needed for 2027.
+- Animation: `animate_buses.py` (own implementation; positions interpolated on `shape_dist_traveled`, style after
+  gtfs_schedules_city: black page, dark basemap, outlined dots with trails). Wednesday 18.11.2026: 474 trips, 23 buses
+  on the road at 07:30.
+- **Scope rule**: everything stays in this repo. Sibling projects (TransitFrequency, subway_like_map,
+  gtfs_schedules_city, osm_basemap) are references only; an attempt to add the city there was reverted (2026-11-16).
+- Next: frequency / accessibility analysis and a network map, implemented here. Feed expires 31.12.2026 — analyses
+  must use a date inside that window; a new export will be needed for 2027.
