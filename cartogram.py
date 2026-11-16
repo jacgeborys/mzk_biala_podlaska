@@ -1,9 +1,9 @@
 """Flow cartogram: every street piece drawn as thick as the number of buses passing it in one day.
 
 All shapes are noded into one network; each piece counts every shape running parallel to it
-within MERGE_M (either direction), so both directions are summed and the two halves of a short
-split around a traffic island both carry the street's full count (drawn on top of each other they
-read as one band). Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
+within MERGE_M (either direction), or within DUAL_M on the same named OSM street, so both
+directions are summed and both carriageways of a divided road / both halves of a split around a
+traffic island carry the street's full count (drawn on top of each other they read as one band). Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
 bar, legend box, credit line).
 
 Output: png/cartogram_<date>.png, layer `segments` in data/gis/biala_podlaska_gtfs.gpkg
@@ -36,6 +36,7 @@ LIMITS = ROOT / "data" / "gis" / "city_limits.gpkg"  # OSM relation 3016433 (Nom
 CRS = "EPSG:2180"
 FRAME_ALL = (773970, 466100, 790310, 476690)   # all stops + 300 m (as animate_buses.py)
 MERGE_M = 20          # shapes this close and parallel count on the same piece (traffic islands)
+DUAL_M = 45           # ... and up to this far when both lie on the same named OSM street (dual carriageways)
 PARALLEL_DEG = 30
 MAX_WIDTH_PT = 16
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
@@ -81,25 +82,48 @@ def piece_counts(date):
         sids.append(sid)
         geoms.append(LineString(zip(x, y)))
     tree = STRtree(geoms)
+    street = street_namer()
     noded = unary_union(geoms)
     pieces = []
     for piece in (noded.geoms if hasattr(noded, "geoms") else [noded]):
         mid = piece.interpolate(0.5, normalized=True)
         h = heading(piece, piece.length / 2)
         hits = []
-        for i in tree.query(mid.buffer(MERGE_M)):
+        name = None
+        for i in tree.query(mid.buffer(DUAL_M)):
             g = geoms[i]
-            if g.distance(mid) > MERGE_M:
-                continue
-            if g.distance(mid) > 1.0:  # the piece's own shapes are always in; others must run parallel
+            dist = g.distance(mid)
+            if dist > 1.0:  # the piece's own shapes are always in; others must run parallel ...
                 dh = abs((heading(g, g.project(mid)) - h + 90) % 180 - 90)
                 if dh > PARALLEL_DEG:
                     continue
+                if dist > MERGE_M:  # ... and beyond MERGE_M lie on the same named street
+                    name = street(mid) if name is None else name
+                    if not name or street(g.interpolate(g.project(mid))) != name:
+                        continue
             hits.append(i)
         if hits:
             pieces.append((piece, sum(int(n_shape[sids[i]]) for i in hits),
                            ",".join(sorted({sids[i].split("_")[0] for i in hits}))))
     return pieces, len(day)
+
+
+def street_namer():
+    """Point -> OSM street name of the nearest drivable edge within 8 m ('' if none)."""
+    import osmnx as ox
+    from shapely.strtree import STRtree
+    e = ox.graph_to_gdfs(ox.load_graphml(ROOT / "data" / "cache" / "osm_drive_service.graphml"), nodes=False)
+    e = e[e["name"].notna()].to_crs(CRS)
+    names = [n if isinstance(n, str) else "/".join(n) for n in e["name"]]
+    lines = list(e.geometry)
+    tree = STRtree(lines)
+
+    def name_at(p):
+        idx = tree.query(p.buffer(8))
+        if len(idx) == 0:
+            return ""
+        return names[min(idx, key=lambda i: lines[i].distance(p))]
+    return name_at
 
 
 def merged_segments(pieces):

@@ -13,7 +13,6 @@ Usage:  python convert_to_gtfs.py [--no-shapes]
 import argparse
 import itertools
 import re
-import shutil
 import zipfile
 from pathlib import Path
 
@@ -42,6 +41,11 @@ ROAD_WEIGHTS = {
 }
 DEFAULT_ROAD_WEIGHT = 1.1
 EXCLUDED_ROADS = {"living_street"}
+# Named streets buses never use although routing would (user, from local knowledge): excluded like living streets
+NO_BUS_STREETS = {
+    "Lotnicza": "residential; D/F/H took it after the turn penalties instead of Kościuszki (2026-11-16)",
+    "Torowa": "residential; D/F/H go straight along Al. Jana Pawła II to Kościuszki (2026-11-16)",
+}
 # OSM ways buses are known to use although their class says otherwise: routed as main roads (weight 1.0)
 BUS_WAYS = {
     123907910: "Białka frontage road north of the trunk, Białka 2 / Białka 3 stops (Street View, 2026-11-16)",
@@ -185,7 +189,9 @@ class Router:
         # merged (simplified) edges carry a list of classes: drop if any part is excluded,
         # otherwise weight by the worst class
         classes = edges.highway.map(lambda h: h if isinstance(h, list) else [h])
-        edges = edges[~classes.map(lambda c: bool(EXCLUDED_ROADS & set(c)))].reset_index(drop=True)
+        names = edges["name"].map(lambda n: set(n) if isinstance(n, list) else {n} if isinstance(n, str) else set())
+        edges = edges[~classes.map(lambda c: bool(EXCLUDED_ROADS & set(c)))
+                      & ~names.map(lambda n: bool(n & NO_BUS_STREETS.keys()))].reset_index(drop=True)
         classes = edges.highway.map(lambda h: h if isinstance(h, list) else [h])
         penalty = classes.map(lambda c: max(ROAD_WEIGHTS.get(x, DEFAULT_ROAD_WEIGHT) for x in c))
         osm_ids = edges.osmid.map(lambda o: set(o) if isinstance(o, list) else {o})
@@ -473,10 +479,9 @@ def main():
     else:
         trips = trips.drop(columns="shape_id")
 
-    # write
-    if OUT.exists():
-        shutil.rmtree(OUT)
-    OUT.mkdir(parents=True)
+    # write: files are overwritten in place (a feed open in QGIS cannot be deleted on Windows);
+    # stale .txt files of a previous run (e.g. shapes.txt after --no-shapes) are removed
+    OUT.mkdir(parents=True, exist_ok=True)
     files = {"agency.txt": pd.DataFrame([AGENCY]), "stops.txt": stops, "routes.txt": routes,
              "trips.txt": trips, "stop_times.txt": st, "calendar_dates.txt": cal,
              "feed_info.txt": feed_info}

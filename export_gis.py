@@ -82,8 +82,7 @@ def main():
     stations = stations.join(child[[f"dep_{d}" for d in DAY_TYPES]].sum(), on="stop_id")
 
     GPKG.parent.mkdir(parents=True, exist_ok=True)
-    if GPKG.exists():
-        GPKG.unlink()
+    # layers are overwritten one by one (the file may be open in QGIS; keeps cartogram.py's `segments`)
     for name, gdf in [("stops", posts), ("stations", stations), ("variants", variants), ("lines", lines)]:
         gdf.to_file(GPKG, layer=name, driver="GPKG")
         print(f"  {name:9s} {len(gdf):4d} features")

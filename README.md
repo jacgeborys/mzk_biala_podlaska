@@ -16,7 +16,7 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
-| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes; parallel shapes within 20 m counted together, so traffic-island splits keep the full count); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
+| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes; parallel shapes within 20 m, or within 45 m on the same named OSM street, counted together, so island splits and dual carriageways read as one street); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
 | `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed) |
 | `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
 | `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
@@ -72,6 +72,11 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
   equal-class side streets: A/F/G/H Sidorska 5 -> Orzechowa 1 now straight up Włoska and left into Orzechowa
   (was Piaskowa -> Pływacka, 64 m shorter but 3 turns; 20 m per turn was not enough). Also removed U-turn loops
   at Dworzec PKP, Terebelska Pętla, Terebela, Al. Solidarności (most legs 30-150 m shorter).
+  **No-bus streets** (`NO_BUS_STREETS`, by OSM name, excluded like living streets): Lotnicza and Torowa (user,
+  2026-11-16): after the turn penalties D / F / H cut through them; they go round Rondo Błogosławionego Ks. and
+  straight down Al. Jana Pawła II to Kościuszki. Residential streets that do carry buses (Orzechowa, Włoska,
+  Kościuszki, Akademicka, Grzybowa, ...) are listed by a check in the session log: review that list when a route
+  looks off.
   **Known bus ways** (`BUS_WAYS`, weight 1.0 whatever their class): OSM has almost no bus data for Biała Podlaska
   (no usable route relations, Overpass not relied on), so ways buses use against their class are listed by hand.
   So far: way 123907910, the unnamed frontage road north of the Białka trunk; E / K / T leave Białka at
@@ -112,10 +117,14 @@ Other projects are only changed for a reason and with the user's OK; their outpu
 - **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): city `bialapodlaska`
   (`bialapodlaska_city` = feed clipped to the city limits, not used any more: the user prefers zooming over
   trimming). `CITY=bialapodlaska python scripts/01_extract_trams.py`, `02_build_network.py`, `03_order_lines.py 1 300000 3`,
-  then `04_render.py --poster --dpi 150 --labels key --stop-scale 0.8 --spacing 25 --groups
+  then `04_render.py --poster --dpi 150 --nyc --labels key --stations topo --transfers none --complexes --stop-scale 0.85
+  --hub-scale 0.7 --platform-cap 40 --corner-radius 100 --joint-round 60 --spacing 25 --groups
   D:/QGIS/gtfs_biala_podlaska/config/diagram_lines.json --extent 778420 466330 793200 474790 --out .../png/bus_network_city.png`
-  (full: `--spacing 35`, no `--extent`). Python: `D:\QGIS\gtfs_schedules_cityenv`. The NYC family colours were
+  (full: `--spacing 35`, no `--extent`). Python: `D:\QGIS\gtfs_schedules_cityenv`.
+  Dworzec PKP: buses run in and out of the station spur off Al. Tysiąclecia without ending there; 02's
+  `spur_stations` (city.py) moves the station onto the junction so it is drawn as the interchange it is. The NYC family colours were
   rejected (2026-11-16): one colour per line, tighter bundles, zoom to the city.
+- Feed files and the GeoPackage are overwritten in place (QGIS keeps them open; deleting fails on Windows).
 - The basemap in `data/basemap/` is a copy of `D:\QGIS\osm_basemapialapodlaska` (made by TransitFrequency).
 
 - Next: polish the subway-style map (legend texts, stations), maybe 10-min walk variant; feed expires
