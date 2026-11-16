@@ -26,6 +26,7 @@ from pathlib import Path
 import geopandas as gpd
 import matplotlib
 import numpy as np
+import shapely
 import pandas as pd
 from pyproj import Transformer
 from shapely.geometry import LineString, Point, box
@@ -51,7 +52,9 @@ STEP_M = 6          # drawn lines are sampled this often
 SIMPLIFY_M = 30     # sections are simplified this much before their corners are rounded (street wiggles go)
 CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
-EXT_SHARE = 0.25    # a line's section with under this share of the trips of its busiest section is an extension (dashed)
+EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
+EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
+EXT_SHARE = 0.25    # where a line runs with under this share of its trips of the day it is an extension (dashed)
 U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
@@ -733,6 +736,33 @@ def lead_in(l, node, i, edges, inc_l, before):
     return (j, edges[j]["v"] == node) if before else (j, edges[j]["u"] == node)
 
 
+def extension_mask(Q, shapes, total):
+    """Per drawn point (centreline Q): True where the line runs with under EXT_SHARE of its trips of the day (an
+    extension, drawn dashed), from the shapes passing within EXT_TOL m. Points no shape passes (schematic parts,
+    rounded corners) take their neighbours' value; runs shorter than EXT_MIN_M m are merged into their neighbours."""
+    pts = shapely.points(Q)
+    cov = np.zeros(len(Q))
+    for g, n in shapes:
+        cov += n * (shapely.distance(pts, g) < EXT_TOL)
+    val = np.where(cov > 0, (cov < EXT_SHARE * total).astype(float), np.nan)
+    if np.isnan(val).all():
+        return np.zeros(len(Q), bool)
+    idx = np.where(~np.isnan(val))[0]                  # fill the gaps from the nearest covered point
+    val = val[idx[np.clip(np.searchsorted(idx, np.arange(len(Q))), 0, len(idx) - 1)]]
+    ext = val > 0.5
+    sd = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(Q, axis=0).T))])
+    for _ in range(100):
+        cut = [0] + [k for k in range(1, len(ext)) if ext[k] != ext[k - 1]] + [len(ext)]
+        runs = [(a, b) for a, b in zip(cut, cut[1:])]
+        if len(runs) < 2:
+            break
+        a, b = min(runs, key=lambda r: sd[r[1] - 1] - sd[r[0]])
+        if sd[b - 1] - sd[a] >= EXT_MIN_M:
+            break
+        ext[a:b] = ~ext[a]
+    return ext
+
+
 _SECTIONS = {}
 PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
 NODE_W = {}     # node -> weight of crossings there (crossings under the station bar are cheap)
@@ -773,7 +803,7 @@ def draw_path(seq, l, edges, orders):
     t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
     nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
-    return Q + nrm * O[:, None], E
+    return Q + nrm * O[:, None], E, Q
 
 
 def station_spots(stations, edges):
@@ -796,7 +826,7 @@ def station_spots(stations, edges):
 
 
 # ---------------------------------------------------------------- render
-def render(edges, orders, stations, line_cfg, date, out):
+def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     order = sorted({l for e in edges for l in e["lines"]})
     limits = gpd.read_file(LIMITS).to_crs(CRS)
     x0, y0, x1, y1 = limits.total_bounds
@@ -834,10 +864,6 @@ def render(edges, orders, stations, line_cfg, date, out):
         for l in e["lines"]:
             inc_l[(l, e["u"])].append(i)
             inc_l[(l, e["v"])].append(i)
-    line_max = defaultdict(int)                   # trips on each line's busiest section
-    for e in edges:
-        for l, n in e.get("trips", {}).items():
-            line_max[l] = max(line_max[l], n)
     drawn = []                                    # drawn lines / capsules (map metres), kept clear of labels
     paths = defaultdict(list)                     # line -> drawn LineStrings
     line_ends = []                                # (line, end point, direction pointing out of the line)
@@ -850,7 +876,7 @@ def render(edges, orders, stations, line_cfg, date, out):
             own = {i for i, _ in seq}
             pre = pre if pre and pre[0] not in own else None
             post = post if post and post[0] not in own and (not pre or post[0] != pre[0]) else None
-            c, E = draw_path(([pre] if pre else []) + seq + ([post] if post else []), l, edges, orders)
+            c, E, Q = draw_path(([pre] if pre else []) + seq + ([post] if post else []), l, edges, orders)
             if len(c) < 2:
                 continue
             sd = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(c, axis=0).T))])
@@ -861,11 +887,10 @@ def render(edges, orders, stations, line_cfg, date, out):
             if post:
                 k1 = len(E) - 1 - int(np.argmax(E[::-1] != post[0]))
                 mask &= sd <= sd[k1] + RAMP_M
-            c, E = c[mask], E[mask]
+            c, E, Q = c[mask], E[mask], Q[mask]
             if len(c) < 2:
                 continue
-            # extensions (sections a line runs on with under EXT_SHARE of its busiest section's trips) dashed
-            ext = np.array([0 < edges[k]["trips"].get(l, 0) < EXT_SHARE * line_max[l] for k in E])
+            ext = extension_mask(Q, shapes.get(l, []), line_trips[l])
             cut = [0] + [k for k in range(1, len(c)) if ext[k] != ext[k - 1]] + [len(c)]
             for a_, b_ in zip(cut, cut[1:]):
                 part = c[max(a_ - 1, 0):b_]
@@ -912,6 +937,7 @@ def render(edges, orders, stations, line_cfg, date, out):
 
     # line ends: at a main terminus of the line an end bar, at the end of an extended variant a white diamond
     ends_at = defaultdict(set)                    # station -> lines whose drawing ends there
+    var_end = defaultdict(set)                    # station -> lines whose extended variant ends there
     for l, xy, d in line_ends:
         cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 250]
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy))) if cand else None
@@ -924,18 +950,21 @@ def render(edges, orders, stations, line_cfg, date, out):
             nrm = np.array([-d[1], d[0]])
             capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
         else:
+            if k is not None:
+                var_end[k].add(l)
             ax.scatter([xy[0]], [xy[1]], marker="D", s=(lw * 1.45) ** 2, facecolor="white",
                        edgecolor=colors.get(l, "#888"), linewidths=lw * 0.38, zorder=5.2)
             drawn.append(Point(xy).buffer(SPACING * 0.6))
 
-    # names: termini only (main termini of a line, and Dworzec PKP); every other stop is a dot on its lines
+    # names: termini only (main termini of a line with round bullets, ends of extended variants with diamond
+    # bullets, and Dworzec PKP); every other stop is a dot on its lines
     requests = []                                 # labels to place
     cap_r = lw * 1.3 / 2 * m_per_pt
     for sid, (i, base, t, ls) in spots.items():
         st_ = stations[sid]
         nrm = np.array([-t[1], t[0]])
         key_st = st_["name"] in KEY_STATIONS
-        if not (st_["term"] or key_st):
+        if not (st_["term"] or key_st or var_end.get(sid)):
             for l in ls:
                 p = on_line(l, base)
                 if p is not None:
@@ -948,13 +977,15 @@ def render(edges, orders, stations, line_cfg, date, out):
         lo, hi = min(side) - SPACING * 0.55, max(side) + SPACING * 0.55
         capsule(base + nrm * lo, base + nrm * hi)
         zone = LineString([base + nrm * lo, base + nrm * hi]).buffer(cap_r + 5)
-        bullets = sorted(st_["term"] | (ends_at.get(sid, set()) if key_st else set()))
+        main = st_["term"] | (ends_at.get(sid, set()) if key_st else set())
+        bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()) - main)]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
     # label placement: as close to the stop as possible (16 directions, sliding outwards from the capsule),
     # off other names at any cost, off the lines where that costs little distance
     occ = [g.buffer(lw * m_per_pt / 2 + 4) for g in drawn]
     occ_tree = STRtree(occ)
+    frame = box(x0 + 60, y0 + 60, x1 - 60, y1 - 60)  # names stay on the map (stops outside it get none)
     placed = []
     labelled = set()
     for prio, _, sid, base, zone, bullets in sorted(requests, key=lambda r: (r[0], r[1])):
@@ -979,7 +1010,7 @@ def render(edges, orders, stations, line_cfg, date, out):
                 bx0 = anchor[0] if v[0] > 0.3 else anchor[0] - w_m if v[0] < -0.3 else anchor[0] - w_m / 2
                 top = anchor[1] + (h_m if v[1] > 0.3 else h_m / 2 if abs(v[1]) <= 0.3 else 0)
                 bb = box(bx0, top - h_m, bx0 + w_m, top)
-                if bb.intersects(zone):
+                if bb.intersects(zone) or not frame.contains(bb):
                     continue
                 first = dist if first is None else first
                 hit = sum(occ[k].intersection(bb).area for k in occ_tree.query(bb))
@@ -987,6 +1018,8 @@ def render(edges, orders, stations, line_cfg, date, out):
                 score = hit + dist * 25
                 if best is None or score < best[0]:
                     best = (score, bb, top, "left" if v[0] > 0.3 else "right" if v[0] < -0.3 else "center")
+        if best is None:
+            continue
         _, bb, top, ha = best
         placed.append(bb)
         ty = top - size * 0.62 * m_per_pt
@@ -995,10 +1028,11 @@ def render(edges, orders, stations, line_cfg, date, out):
         ax.text(tx, ty, name, fontproperties=font(size), color=INK, ha=ha, va="center", path_effects=halo, zorder=7)
         row_w = len(bullets) * 15 * m_per_pt
         bx0 = {"left": tx, "right": tx - row_w, "center": tx - row_w / 2}[ha]
-        for k, l in enumerate(bullets):     # lines ending here: bullets under the name
+        for k, (l, mk) in enumerate(bullets):  # lines ending here: bullets under the name (diamond: variant)
             bx = bx0 + (k * 15 + 7) * m_per_pt
             by = ty - (size * 0.62 + 9) * m_per_pt
-            ax.scatter([bx], [by], s=13 ** 2, color=colors.get(l, "#888"), zorder=7, linewidths=0)
+            ax.scatter([bx], [by], marker=mk, s=(13 if mk == "o" else 11.5) ** 2, color=colors.get(l, "#888"),
+                       zorder=7, linewidths=0)
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
 
     # title + legend panel
@@ -1045,7 +1079,10 @@ def main():
     edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
-    render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
+    shapes = defaultdict(list)                   # line -> [(shape, trips of the day)], for the dashed extensions
+    for sid, g in geoms.items():
+        shapes[line_of[sid]].append((g, int(n_shape[sid])))
+    render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out, shapes, line_trips)
 
 
 if __name__ == "__main__":
