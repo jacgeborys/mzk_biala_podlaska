@@ -42,6 +42,10 @@ ROAD_WEIGHTS = {
 }
 DEFAULT_ROAD_WEIGHT = 1.1
 EXCLUDED_ROADS = {"living_street"}
+# OSM ways buses are known to use although their class says otherwise: routed as main roads (weight 1.0)
+BUS_WAYS = {
+    123907910: "Białka frontage road north of the trunk, Białka 2 / Białka 3 stops (Street View, 2026-11-16)",
+}
 # Turn penalties (in weighted metres), so routes do not zigzag through side streets
 # when a straighter path of equal length exists
 TURN_FREE_DEG = 20      # heading changes below this are free
@@ -184,7 +188,9 @@ class Router:
         edges = edges[~classes.map(lambda c: bool(EXCLUDED_ROADS & set(c)))].reset_index(drop=True)
         classes = edges.highway.map(lambda h: h if isinstance(h, list) else [h])
         penalty = classes.map(lambda c: max(ROAD_WEIGHTS.get(x, DEFAULT_ROAD_WEIGHT) for x in c))
-        edges["w"] = edges.geometry.length * penalty.values
+        osm_ids = edges.osmid.map(lambda o: set(o) if isinstance(o, list) else {o})
+        penalty = np.where(osm_ids.map(lambda o: bool(o & BUS_WAYS.keys())), 1.0, penalty.values)
+        edges["w"] = edges.geometry.length * penalty
         self.edges = edges
         self.u, self.v = edges.u.values, edges.v.values
         self.len = edges.geometry.length.values

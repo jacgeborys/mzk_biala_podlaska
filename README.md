@@ -60,6 +60,10 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
   equal-class side streets: A/F/G/H Sidorska 5 -> Orzechowa 1 now straight up Włoska and left into Orzechowa
   (was Piaskowa -> Pływacka, 64 m shorter but 3 turns; 20 m per turn was not enough). Also removed U-turn loops
   at Dworzec PKP, Terebelska Pętla, Terebela, Al. Solidarności (most legs 30-150 m shorter).
+  **Known bus ways** (`BUS_WAYS`, weight 1.0 whatever their class): OSM has almost no bus data for Biała Podlaska
+  (no usable route relations, Overpass not relied on), so ways buses use against their class are listed by hand.
+  So far: way 123907910, the unnamed frontage road north of the Białka trunk; E / K / T leave Białka at
+  Powstańców and serve Białka 2 / Białka 3 there in both directions (user, Street View 2026-11-16).
   `shape_dist_traveled` in metres in shapes and stop_times. All stops lie within ~31 m of their shape.
 - **Routes**: `route_type=3`, long name from the basic variant, colours assigned arbitrarily (`LINE_COLORS`).
 - Trip notes (`UWAGI_KURS`) are not exported; headsigns come from the variant. Seasonal notes do not affect this
@@ -68,7 +72,8 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 ## Status (2026-11-16)
 
 - GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing uses road class weights (residential 1.6),
-  living streets excluded, turn penalties (Włoska / Orzechowa zigzag fixed, checked by the user's local knowledge).
+  living streets excluded, turn penalties (Włoska / Orzechowa zigzag fixed), Białka frontage road via `BUS_WAYS`
+  (both verified by the user).
 - Feed built: 13 lines (A–M, T weekends only), 318 posts / 172 stations, 1249 trips, 25 613 stop times, 102 shapes;
   valid 10.11–31.12.2026.
 - MobilityData validator v8.0.1: **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`
