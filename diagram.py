@@ -437,25 +437,25 @@ def station_access(edges, stations):
         for k_ in sts:
             stations[k_]["xy"] = Sx - perp * 1.0                     # on the leg every line uses
         out = keep
-        # how A / C / I pair their four sections at the crossing: the left leg with the arm further west (A: Al.
-        # 1000-lecia north, C, I: Sidorska west), the right leg with the other one. Tried all four ways round: this
-        # one leaves no crossing above the station (14 counted at it, under the bar); C / I the other way: 10 above
+        # how A / C / I pair their four sections at the crossing: the right leg with Al. 1000-lecia north, the left
+        # leg with the other arm (A: Sidorska east, C, I: Sidorska west). Of the four ways round this one has the
+        # fewest crossings along Al. 1000-lecia in all (2 at the crossing + 10 counted at the station)
         idx = {id(f): k for k, f in enumerate(out)}
         left_k = idx[id(next(f for f in out if f.get("raw") and f["u"] == N2))]
         right_k = next((idx[id(f)] for f in out if f.get("raw") and f["v"] == N2), None)
 
-        def east(k):
+        def south(k):
             g_ = out[k]["geom"]
             d_ = min(60, g_.length / 2)
             q = g_.interpolate(d_ if out[k]["u"] == N2 else g_.length - d_)
-            return float(np.dot(np.array(q.coords[0]) - P0, perp))
+            return float(np.dot(np.array(q.coords[0]) - P0, dv))
         for l in u_lines:
             arms = [k for k, f in enumerate(out) if l in f["lines"] and N2 in (f["u"], f["v"])
                     and k not in (left_k, right_k)]
             if len(arms) != 2 or right_k is None:
                 continue
-            w_arm, e_arm = sorted(arms, key=east)
-            PAIRS[(l, N2)] = {left_k: w_arm, w_arm: left_k, right_k: e_arm, e_arm: right_k}
+            n_arm, o_arm = sorted(arms, key=south)
+            PAIRS[(l, N2)] = {right_k: n_arm, n_arm: right_k, left_k: o_arm, o_arm: left_k}
         NODE_W[key(Sx)] = STATION_CROSS_W
         NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
