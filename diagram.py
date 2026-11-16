@@ -51,7 +51,8 @@ STEP_M = 6          # drawn lines are sampled this often
 SIMPLIFY_M = 30     # sections are simplified this much before their corners are rounded (street wiggles go)
 CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
-STATION_DROP_M = 160  # Dworzec PKP: the through lines continue straight on this far past the station (schematic)
+EXT_SHARE = 0.25    # a line's section with under this share of the trips of its busiest section is an extension (dashed)
+STATION_DROP_M = 240  # Dworzec PKP: the through lines continue straight on this far past the station (schematic)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -335,16 +336,25 @@ def contract_short(edges, min_len=None):
     return out
 
 
-def station_access(edges, stations, geoms, line_of):
-    """Dworzec PKP drawn schematically: buses run down Al. 1000-lecia to the station, some turn back there, the
-    rest go on east to the roundabout. The corridor builder sees one loop through the station carrying every line
-    to the roundabout; it is split where it passes the station into the access leg (all lines, drawn straight
-    through the station) and the through leg (only the lines whose routes use it), which continues straight on
-    STATION_DROP_M m before turning, so the station sits in a straight bundle all lines pass through."""
+def edge_trips(edges, geoms, n_shape, line_of):
+    """Trips of the day per line along every edge (shapes running along it, TOL m): e["trips"] = {line: n}."""
+    for e in edges:
+        g = e["geom"]
+        probe = [g.interpolate(f, normalized=True) for f in (0.25, 0.5, 0.75)]
+        t = defaultdict(int)
+        for sid, sh in geoms.items():
+            if line_of[sid] in e["lines"] and all(sh.distance(q) < TOL for q in probe):
+                t[line_of[sid]] += int(n_shape[sid])
+        e["trips"] = dict(t)
+    return edges
+
+
+def station_access(edges, stations):
+    """Dworzec PKP drawn schematically. In reality the buses run down Al. 1000-lecia to a dead end at the station
+    and turn back. The map shows a vertical station all the lines from the north pass straight through; below it
+    the bundle splits: lines that go on west (Sidorska west of Al. 1000-lecia) peel off to the left, lines that go
+    on east (to the roundabout at Al. Jana Pawła II) to the right. The real hairpins back up to Sidorska go."""
     key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
-    by_line = defaultdict(list)
-    for sid, g in geoms.items():
-        by_line[line_of[sid]].append(g)
     out = [e for e in edges if e["u"] != e["v"] and e["geom"].length >= 1]
     for name in KEY_STATIONS:
         sts = [k for k, s in stations.items() if s["name"] == name]
@@ -359,41 +369,64 @@ def station_access(edges, stations, geoms, line_of):
         d = g.project(Point(xy))
         if d < 50 or d > g.length - 50:
             continue
-        legs = [LineString([g.interpolate(x) for x in np.linspace(0, d, 40)]),
-                LineString([g.interpolate(x) for x in np.linspace(d, g.length, 80)])]
-        on = []
-        for leg in legs:
-            probe = [leg.interpolate(f, normalized=True) for f in (0.3, 0.5, 0.7)]
-            on.append(frozenset(l for l in e["lines"]
-                                if any(all(sh.distance(p) < TOL for p in probe) for sh in by_line[l])))
-        a = 0 if len(on[0]) >= len(on[1]) else 1          # access leg: the one every line uses
-        acc, thr = legs[a], legs[1 - a]
-        if a == 1:
-            acc = LineString(list(acc.coords)[::-1])        # both legs start at the far ends, meet at the station
-        else:
-            thr = LineString(list(thr.coords)[::-1])
-        acc_c, thr_c = np.array(acc.coords), np.array(thr.coords)  # acc: far end -> station; thr: far end -> station
+        # the shorter leg from the station is the access road (Al. 1000-lecia), the longer one the road east
+        legs = [(g.interpolate(0), e["u"], [g.interpolate(x) for x in np.linspace(d, 0, 40)]),
+                (g.interpolate(g.length), e["v"], [g.interpolate(x) for x in np.linspace(d, g.length, 80)])]
+        legs.sort(key=lambda t: LineString(t[2]).length)
+        (_, N2, acc_pts), (_, N1, thr_pts) = legs
+        acc_c = np.array([p.coords[0] for p in acc_pts])[::-1]      # N2 -> station
+        thr_c = np.array([p.coords[0] for p in thr_pts])[::-1]      # N1 -> station
         J = acc_c[-1]
-        dv = J - np.array(acc.interpolate(acc.length - min(150, acc.length / 2)).coords[0])
-        dv /= np.hypot(*dv)
-        # through leg: straight on past the station, then its corner (farthest point from the chord) moved as well
+        dv = J - acc_c[0]
+        dv /= np.hypot(*dv)                                           # pointing down the access road
+        side = lambda q: np.sign(dv[0] * (q[1] - J[1]) - dv[1] * (q[0] - J[0]))  # noqa: E731
+        east_side = side(np.array(N1))
+        at = lambda n: [k for k, f in enumerate(out) if k != i and n in (f["u"], f["v"])]  # noqa: E731
+        far = lambda f, n: f["v"] if f["u"] == n else f["u"]  # noqa: E731
+        direct = [k for k in at(N2) if far(out[k], N2) == N1]        # Sidorska N2 - N1 (A's real way back)
+        west = [k for k in at(N2) if k not in direct and side(np.array(far(out[k], N2))) == -east_side
+                and abs(np.dot(dv, np.array(far(out[k], N2)) - np.array(N2)) /
+                        np.hypot(*(np.array(far(out[k], N2)) - np.array(N2)))) < 0.6]
+        north = [k for k in at(N2) if k not in direct and k not in west]
+        L = e["lines"]
+        west_lines = L & frozenset().union(*[out[k]["lines"] for k in west]) if west else frozenset()
+        east_lines = (L & frozenset().union(*[out[k]["lines"] for k in at(N1)])) - west_lines
+        north_lines = L & frozenset().union(*[out[k]["lines"] for k in north]) if north else L
+        trips = e.get("trips", {})
+        new = []
+        for k in west + direct:                                       # the hairpins' other halves go
+            ls = out[k]["lines"] - (west_lines if k in west else east_lines)
+            if ls:
+                new.append(dict(out[k], lines=ls))
+            if k in west:
+                W = far(out[k], N2)
+                west_trips = out[k].get("trips", {})
+        drop = STATION_DROP_M
         chord = LineString([thr_c[0], thr_c[-1]])
-        k = int(np.argmax([chord.distance(Point(p)) for p in thr_c]))
-        new_thr = np.vstack([thr_c[:k + 1], [thr_c[k] + dv * STATION_DROP_M, J + dv * STATION_DROP_M, J]])
-        for st in stations.values():                      # stops on the through leg follow it
-            if st["name"] != name and Point(st["xy"]).distance(thr) < 40:
-                st["xy"] = st["xy"] + dv * STATION_DROP_M * 0.5
-        for k_ in sts:                                    # the station: on the access leg, just before the split
-            stations[k_]["xy"] = J - dv * 1.0
-        nodes_ = (e["u"], e["v"]) if a == 0 else (e["v"], e["u"])
-        acc_g = LineString([nodes_[0]] + [tuple(p) for p in acc_c[1:-1]] + [tuple(J)])
-        thr_g = LineString([nodes_[1]] + [tuple(p) for p in new_thr[1:]])
-        all_lines = e["lines"]
-        thr_lines = on[1 - a] or all_lines
-        out[i] = dict(geom=acc_g, lines=all_lines, u=nodes_[0], v=key(J))
-        out.append(dict(geom=thr_g, lines=thr_lines, u=nodes_[1], v=key(J)))
-        print(f"{name}: access leg {sorted(all_lines)} {acc_g.length:.0f} m, "
-              f"through leg {sorted(thr_lines)} {thr_g.length:.0f} m")
+        kc = int(np.argmax([chord.distance(Point(p)) for p in thr_c]))
+        K = J + dv * drop                                             # the split, a straight stem below the station
+        thr_g = np.vstack([thr_c[:kc + 1], [thr_c[kc] + dv * drop, K]])
+        perp = np.array([-dv[1], dv[0]])
+        perp = perp if side(J + perp) == east_side else -perp           # towards the east side
+        for st in stations.values():                                  # stops on the road east follow it
+            if st["name"] != name and Point(st["xy"]).distance(LineString(thr_c)) < 40:
+                st["xy"] = st["xy"] + dv * drop * 0.5
+        for k_ in sts:
+            stations[k_]["xy"] = J + dv * 1.0
+        keep = [f for k, f in enumerate(out) if k != i and k not in west + direct]
+        keep.append(dict(geom=LineString([N2] + [tuple(p) for p in acc_c[1:-1]] + [tuple(J)]), lines=north_lines,
+                         u=N2, v=key(J), trips={l: trips.get(l, 0) for l in north_lines}))
+        stem = (north_lines & (east_lines | west_lines)) | east_lines | west_lines
+        keep.append(dict(geom=LineString([tuple(J), tuple(K)]), lines=stem, u=key(J), v=key(K),
+                         trips={l: max(trips.get(l, 0), west_trips.get(l, 0) if west_lines else 0) for l in stem}))
+        keep.append(dict(geom=LineString([N1] + [tuple(p) for p in thr_g[1:]]), lines=east_lines, u=N1, v=key(K),
+                         trips={l: trips.get(l, 0) for l in east_lines}))
+        if west_lines:
+            keep.append(dict(geom=LineString([W, tuple(K - perp * 200), tuple(K)]), lines=west_lines, u=W, v=key(K),
+                             trips={l: west_trips.get(l, 0) for l in west_lines}))
+        out = keep + new
+        print(f"{name}: from the north {sorted(north_lines)}, off to the west {sorted(west_lines)}, "
+              f"off to the east {sorted(east_lines)}")
     return out
 
 
@@ -625,7 +658,7 @@ def draw_path(seq, l, edges, orders):
     """Drawn coordinates of one chain (subway_like_map style): each section simplified, corners (inside sections
     and at junctions) replaced by circular arcs of radius CORNER_R, the lane offset eased over RAMP_M m wherever
     it changes, then applied along the normals, so a bundle bends as concentric arcs."""
-    pts, seg_off = [], []
+    pts, seg_off, seg_edge = [], [], []
     for i, fwd in seq:
         if i not in _SECTIONS:
             _SECTIONS[i] = section_coords(edges[i], len(orders[i]))
@@ -635,25 +668,28 @@ def draw_path(seq, l, edges, orders):
             c = c[1:]
         pts.extend(c)
         seg_off.extend([o] * len(c))
+        seg_edge.extend([i] * len(c))
     P = np.array(pts)
     seg_off = np.array(seg_off[1:] if len(seg_off) > 1 else seg_off, dtype=float)  # offset of segment k: P[k]-P[k+1]
+    seg_edge = np.array(seg_edge[1:] if len(seg_edge) > 1 else seg_edge)
     if len(P) < 2:
-        return P
+        return P, np.full(len(P), seq[0][0])
     F, sid = fillet(P, CORNER_R)
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
     keep = np.concatenate([[True], np.diff(s) > 1e-6])
     F, s, sid = F[keep], s[keep], np.array(sid)[keep]
     if s[-1] < 1:
-        return F
+        return F, np.full(len(F), seq[0][0])
     ds = np.append(np.arange(0, s[-1], STEP_M), s[-1])
     Q = np.column_stack([np.interp(ds, s, F[:, 0]), np.interp(ds, s, F[:, 1])])
-    O = seg_off[np.clip(sid[np.clip(np.searchsorted(s, ds, side="right") - 1, 0, len(sid) - 1)], 0, len(seg_off) - 1)]
+    k_ = np.clip(sid[np.clip(np.searchsorted(s, ds, side="right") - 1, 0, len(sid) - 1)], 0, len(seg_off) - 1)
+    O, E = seg_off[k_], seg_edge[k_]
     O = smooth(O[:, None].astype(float), RAMP_M)[:, 0]
     t = np.gradient(Q, axis=0)
     t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
     nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
-    return Q + nrm * O[:, None]
+    return Q + nrm * O[:, None], E
 
 
 def station_spots(stations, edges):
@@ -709,16 +745,31 @@ def render(edges, orders, stations, line_cfg, date, out):
     limits.boundary.plot(ax=ax, color="#9a9a9a", linewidth=1.0, linestyle=(0, (5, 4)), zorder=1.5, aspect=None)
 
     colors = {l: c for l, c in zip([g[0] for g in line_cfg["groups"]], line_cfg["colors"])}
+    line_max = defaultdict(int)                   # trips on each line's busiest section
+    for e in edges:
+        for l, n in e.get("trips", {}).items():
+            line_max[l] = max(line_max[l], n)
     drawn = []                                    # drawn lines / capsules (map metres), kept clear of labels
     paths = defaultdict(list)                     # line -> drawn LineStrings
     line_ends = []                                # (line, end point, direction pointing out of the line)
     for l in order:
         for seq in chain_seqs(l, edges):
-            c = draw_path(seq, l, edges, orders)
+            c, E = draw_path(seq, l, edges, orders)
             if len(c) < 2:
                 continue
-            ax.plot(c[:, 0], c[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
-                    solid_joinstyle="round", zorder=3)
+            # extensions (sections a line runs on with under EXT_SHARE of its busiest section's trips) dashed
+            ext = np.array([0 < edges[k]["trips"].get(l, 0) < EXT_SHARE * line_max[l] for k in E])
+            cut = [0] + [k for k in range(1, len(c)) if ext[k] != ext[k - 1]] + [len(c)]
+            for a_, b_ in zip(cut, cut[1:]):
+                part = c[max(a_ - 1, 0):b_]
+                if len(part) < 2:
+                    continue
+                if ext[a_]:
+                    ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, dash_capstyle="butt",
+                            linestyle=(0, (1.6, 0.9)), zorder=3)
+                else:
+                    ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
+                            solid_joinstyle="round", zorder=3)
             g = LineString(c)
             drawn.append(g)
             paths[l].append(g)
@@ -884,7 +935,7 @@ def main():
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
     edges = contract_short(repair_lines(build_edges(pieces, sets), geoms, line_of))
-    edges = station_access(edges, stations, geoms, line_of)
+    edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
     render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
