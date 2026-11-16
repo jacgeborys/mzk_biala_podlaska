@@ -47,7 +47,11 @@ TOL = 35            # m: routes this close and parallel are one corridor (direct
 MIN_PART = 40       # m: shorter leftovers of the corridor dedupe are dropped
 PARALLEL_DEG = 35
 SPACING = 26        # m between lanes of a bundle
-ROUND_M = 12        # corner rounding (densify step for Chaikin smoothing)
+STEP_M = 6          # drawn lines are sampled this often
+CURVE_M = 45        # centreline smoothing window: corners become curves of roughly this size
+RAMP_M = 80         # a line changing lane at a junction moves over this length (no jag)
+CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
+SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
 MAIN_TERMINUS = 0.5               # a station is a line's terminus when this share of its trips start or end there
@@ -305,121 +309,168 @@ def repair_lines(edges, geoms, line_of):
     return out
 
 
-# ---------------------------------------------------------------- 4: line order
+def contract_short(edges, min_len=None):
+    """Junction clusters joined by edges shorter than CONTRACT_M m become one junction (at their centre): lines
+    then change order once, with room for the lane ramps, instead of curling over a few metres of corridor."""
+    import networkx as nx
+    min_len = min_len or CONTRACT_M
+    G = nx.Graph()
+    G.add_edges_from((e["u"], e["v"]) for e in edges if e["geom"].length < min_len and e["u"] != e["v"])
+    rep = {}
+    for comp in nx.connected_components(G):
+        c = tuple(np.round(np.array(list(comp)).mean(axis=0), 1))
+        for n in comp:
+            rep[n] = c
+    out = []
+    for e in edges:
+        u, v = rep.get(e["u"], e["u"]), rep.get(e["v"], e["v"])
+        if u == v and e["geom"].length < min_len:
+            continue
+        coords = list(e["geom"].coords)
+        coords[0], coords[-1] = u, v
+        out.append(dict(geom=LineString(coords), lines=e["lines"], u=u, v=v))
+    print(f"junction clusters merged: {len(set(rep.values()))} ({len(edges) - len(out)} short edges removed)")
+    return out
+
+
+# ---------------------------------------------------------------- 4: line order (per edge)
 def node_passes(edges):
-    """For every node: incident edges (with direction away from the node) and, per line, the edges it uses."""
+    """For every node: incident edges with their heading away from the node and +1 / -1 (edge leaves / enters)."""
     nodes = defaultdict(list)
     for i, e in enumerate(edges):
         g = e["geom"]
-        a = heading_at(g, min(15, g.length / 2))
-        b = heading_at(g, max(0, g.length - min(15, g.length / 2))) + math.pi
-        nodes[e["u"]].append((i, a, +1))   # +1: the edge leaves the node in its own direction
-        nodes[e["v"]].append((i, b, -1))
+        k = min(25, g.length / 2)
+        nodes[e["u"]].append((i, heading_at(g, k), +1))
+        nodes[e["v"]].append((i, heading_at(g, g.length - k) + math.pi, -1))
     return nodes
 
 
-def crossings(order, edges, nodes):
-    rank = {l: k for k, l in enumerate(order)}
+def left_of(orders, i, l, sgn):
+    """Lateral lane position of line l on edge i, left positive, looking away from the node (sgn: +1 at u)."""
+    ls = orders[i]
+    return sgn * ((len(ls) - 1) / 2 - ls.index(l))
 
-    def lat(i, l, sgn):  # lateral position (left positive) looking away from the node along edge i
-        ls = sorted(edges[i]["lines"], key=rank.get)
-        return sgn * ((len(ls) - 1) / 2 - ls.index(l))
-    cost = 0
-    for n, inc in nodes.items():
-        if len(inc) < 2:
-            continue
-        per_line = defaultdict(list)
-        for i, h, sgn in inc:
-            for l in edges[i]["lines"]:
-                per_line[l].append((i, h, sgn))
-        ls = list(per_line)
-        for x in range(len(ls)):
-            for y in range(x + 1, len(ls)):
-                a, b = ls[x], ls[y]
-                ea = {i: (h, s) for i, h, s in per_line[a]}
-                eb = {i: (h, s) for i, h, s in per_line[b]}
-                for p in set(ea) & set(eb):
-                    hp, sp = ea[p]
-                    la_in, lb_in = -lat(p, a, sp), -lat(p, b, sp)   # looking into the node along p
-                    for qa in ea:
-                        for qb in eb:
-                            if qa == p or qb == p:
-                                continue
-                            if qa == qb:     # continue together: lateral order must stay
-                                hq, sq = ea[qa]
-                                if (la_in > lb_in) != (lat(qa, a, sq) > lat(qa, b, sq)):
-                                    cost += 1
-                            else:            # split: the line turning more to the left should be on the left
-                                ta = (ea[qa][0] - (hp + math.pi)) % (2 * math.pi)
-                                tb = (eb[qb][0] - (hp + math.pi)) % (2 * math.pi)
-                                if abs(ta - tb) > 1e-3 and (la_in > lb_in) != (ta > tb):
-                                    cost += 1
+
+def turn(h_from_entry, h_out):
+    """Signed turn angle (left positive, -pi..pi) from the direction of travel into the node to an exit."""
+    return (h_out - h_from_entry + math.pi) % (2 * math.pi) - math.pi
+
+
+def node_cost(inc, orders, edges):
+    """Crossings at one node (pairs of lines whose left/right order is wrong) + SHIFT_COST per lane shifted."""
+    per_line = defaultdict(dict)
+    for i, h, sgn in inc:
+        for l in orders[i]:
+            per_line[l][i] = (h, sgn)
+    cost = 0.0
+    ls = list(per_line)
+    for a in ls:                                         # lane shifts of a line passing straight through
+        ea = per_line[a]
+        if len(ea) == 2:
+            (p, (hp, sp)), (q, (hq, sq)) = ea.items()
+            cost += SHIFT_COST * abs(-left_of(orders, p, a, sp) - left_of(orders, q, a, sq))
+    # pairs only among lines passing through once (two edges here): at terminal loops a line touches the node
+    # three times and every order "crosses" somewhere, which would drown the real junctions
+    ls = [l for l in ls if len(per_line[l]) == 2]
+    for x in range(len(ls)):
+        for y in range(x + 1, len(ls)):
+            a, b = ls[x], ls[y]
+            ea, eb = per_line[a], per_line[b]
+            for p in set(ea) & set(eb):
+                hp, sp = ea[p]
+                entry = hp + math.pi                     # direction of travel into the node along p
+                la, lb = -left_of(orders, p, a, sp), -left_of(orders, p, b, sp)
+                for qa, (ha, sa) in ea.items():
+                    for qb, (hb, sb) in eb.items():
+                        if qa == p or qb == p:
+                            continue
+                        if qa == qb:                     # on together: left/right must stay
+                            if (la > lb) != (left_of(orders, qa, a, sa) > left_of(orders, qa, b, sb)):
+                                cost += 1
+                        else:                            # split: the line turning further left keeps left
+                            ta, tb = turn(entry, ha), turn(entry, hb)
+                            if abs(ta - tb) > 0.05 and (la > lb) != (ta > tb):
+                                cost += 1
     return cost
 
 
-def best_order(lines, edges, seed, iters=5000, restarts=2):
+def global_start(lines, edges, nodes, seed, iters=3000):
+    """A good common order to start from (annealing over one order for all edges)."""
+    rnd = random.Random(seed)
+    def orders_for(order):
+        rank = {l: k for k, l in enumerate(order)}
+        return [sorted(e["lines"], key=rank.get) for e in edges]
+    def total(order):
+        o = orders_for(order)
+        return sum(node_cost(inc, o, edges) for inc in nodes.values())
+    cur = sorted(lines)
+    cur_c = total(cur)
+    best, best_c = cur[:], cur_c
+    for it in range(iters):
+        cand = cur[:]
+        i, j = rnd.sample(range(len(cand)), 2)
+        cand.insert(j, cand.pop(i))
+        c = total(cand)
+        T = 2.0 * (1 - it / iters) + 1e-3
+        if c <= cur_c or rnd.random() < math.exp((cur_c - c) / T):
+            cur, cur_c = cand, c
+            if c < best_c:
+                best, best_c = cand[:], c
+    return orders_for(best), best_c
+
+
+def best_orders(lines, edges, seed, iters=60000):
+    """Per-edge line orders: start from the best common order, then anneal single edges (swap two lines on one
+    edge; only the costs at its two end nodes change)."""
     nodes = node_passes(edges)
-    best, best_c = None, None
-    for r in range(restarts):
-        rnd = random.Random(seed * 100 + r)
-        cur = sorted(lines)
-        rnd.shuffle(cur)
-        cur_c = crossings(cur, edges, nodes)
-        T0 = 3.0
-        for it in range(iters):
-            cand = cur[:]
-            if rnd.random() < 0.5:                       # swap two lines
-                i, j = rnd.sample(range(len(cand)), 2)
-                cand[i], cand[j] = cand[j], cand[i]
-            else:                                         # move one line elsewhere
-                i, j = rnd.sample(range(len(cand)), 2)
-                cand.insert(j, cand.pop(i))
-            c = crossings(cand, edges, nodes)
-            T = T0 * (1 - it / iters) + 1e-3
-            if c <= cur_c or rnd.random() < math.exp((cur_c - c) / T):
-                cur, cur_c = cand, c
-                if best_c is None or c < best_c:
-                    best, best_c = cand[:], c
-    return best, best_c
+    orders, start_c = global_start(lines, edges, nodes, seed)
+    ends = [(e["u"], e["v"]) for e in edges]
+    cost_at = {n: node_cost(inc, orders, edges) for n, inc in nodes.items()}
+    multi = [i for i, o in enumerate(orders) if len(o) > 1]
+    rnd = random.Random(seed + 7)
+    cur_total = sum(cost_at.values())
+    best, best_total = [o[:] for o in orders], cur_total
+    for it in range(iters):
+        i = rnd.choice(multi)
+        a_, b_ = rnd.sample(range(len(orders[i])), 2)
+        orders[i][a_], orders[i][b_] = orders[i][b_], orders[i][a_]
+        touched = set(ends[i])
+        new = {n: node_cost(nodes[n], orders, edges) for n in touched}
+        delta = sum(new[n] - cost_at[n] for n in touched)
+        T = 1.0 * (1 - it / iters) + 1e-3
+        if delta <= 0 or rnd.random() < math.exp(-delta / T):
+            cost_at.update(new)
+            cur_total += delta
+            if cur_total < best_total - 1e-9:
+                best, best_total = [o[:] for o in orders], cur_total
+        else:
+            orders[i][a_], orders[i][b_] = orders[i][b_], orders[i][a_]
+    print(f"line order: common order cost {start_c:.1f} -> per-edge orders {best_total:.1f}")
+    return best
 
 
 # ---------------------------------------------------------------- 5: drawing geometry
-def lane_offset(e, l, rank):
-    ls = sorted(e["lines"], key=rank.get)
+def lane(orders, i, l):
+    ls = orders[i]
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING
 
 
-def offset_coords(g, d):
-    if abs(d) < 1e-6:
-        return list(g.coords)
-    o = g.offset_curve(d, join_style="round", quad_segs=4)
-    ps = parts(o)
-    if not ps:
-        return list(g.coords)
-    o = max(ps, key=lambda p: p.length)
-    c = list(o.coords)
-    # keep the direction of g
-    if Point(c[0]).distance(Point(g.coords[0])) > Point(c[-1]).distance(Point(g.coords[0])):
-        c = c[::-1]
-    return c
+def smooth(v, window):
+    """Moving average along the first axis (ends held), applied twice: a soft, symmetric kernel."""
+    k = max(1, int(round(window / STEP_M)))
+    if k < 2 or len(v) < 3:
+        return v
+    pad = k
+    for _ in range(2):
+        vp = np.concatenate([np.repeat(v[:1], pad, axis=0), v, np.repeat(v[-1:], pad, axis=0)])
+        c = np.cumsum(vp, axis=0)
+        c = np.concatenate([np.zeros((1,) + v.shape[1:]), c])
+        v = (c[k:] - c[:-k])[pad - k // 2: pad - k // 2 + len(v)] / k
+    return v
 
 
-def chaikin(coords, step=ROUND_M, rounds=3):
-    g = LineString(coords)
-    if g.length < 2 * step:
-        return coords
-    pts = np.array([g.interpolate(t).coords[0] for t in np.arange(0, g.length, step)] + [coords[-1]])
-    for _ in range(rounds):
-        q = 0.75 * pts[:-1] + 0.25 * pts[1:]
-        r = 0.25 * pts[:-1] + 0.75 * pts[1:]
-        mid = np.empty((2 * len(q), 2))
-        mid[0::2], mid[1::2] = q, r
-        pts = np.vstack([pts[:1], mid, pts[-1:]])
-    return pts
-
-
-def line_chains(l, edges, rank):
-    """Continuous drawn paths of line l: its edges chained through nodes where it has exactly two edges."""
+def chain_seqs(l, edges):
+    """Edges of line l chained through nodes where it has exactly two edges: [(edge, forward), ...]."""
     mine = [i for i, e in enumerate(edges) if l in e["lines"]]
     inc = defaultdict(list)
     for i in mine:
@@ -438,27 +489,48 @@ def line_chains(l, edges, rank):
             nxt = [j for j in inc[node] if j != i and j not in used]
             i = nxt[0] if len(inc[node]) == 2 and nxt else None
         return seq
-    starts = [n for n, es in inc.items() if len(es) != 2]
-    for n in starts:
+    for n in [n for n, es in inc.items() if len(es) != 2]:
         for i in inc[n]:
             if i not in used:
                 chains.append(walk(n, i))
     for i in mine:  # closed loops
         if i not in used:
             chains.append(walk(edges[i]["u"], i))
-    out = []
-    for seq in chains:
-        coords = []
-        for i, fwd in seq:
-            c = offset_coords(edges[i]["geom"], lane_offset(edges[i], l, rank))
-            coords += c if fwd else c[::-1]
-        if len(coords) >= 2:
-            out.append(chaikin(coords))
-    return out
+    return chains
 
 
-def station_spots(stations, edges, rank):
-    """Station -> (edge index, point on the corridor, unit tangent, lines drawn there)."""
+def draw_path(seq, l, edges, orders):
+    """Drawn coordinates of one chain: the centreline sampled every STEP_M m and smoothed into curves, the lane
+    offset ramped over RAMP_M m wherever it changes, then offset sideways along the smoothed normals."""
+    pts, off = [], []
+    for i, fwd in seq:
+        g = edges[i]["geom"].simplify(3)
+        c = np.array(g.coords if fwd else g.coords[::-1])
+        L = LineString(c)
+        ds = np.arange(0, L.length, STEP_M) if L.length > STEP_M else np.array([0.0])
+        q = np.array([L.interpolate(d).coords[0] for d in ds])
+        o = lane(orders, i, l) * (1 if fwd else -1)
+        if pts and np.hypot(*(pts[-1] - q[0])) < 0.5:
+            q = q[1:]
+        pts.extend(q)
+        off.extend([o] * len(q))
+    last = seq[-1]
+    g = edges[last[0]]["geom"]
+    pts.append(np.array(g.coords[-1] if last[1] else g.coords[0]))
+    off.append(off[-1])
+    P, O = np.array(pts), np.array(off, dtype=float)
+    if len(P) < 3:
+        return P
+    P = smooth(P, CURVE_M)
+    O = smooth(O[:, None], RAMP_M)[:, 0]
+    t = np.gradient(P, axis=0)
+    t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
+    nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
+    return P + nrm * O[:, None]
+
+
+def station_spots(stations, edges):
+    """Station -> (edge index, point on the corridor, unit tangent, lines of the station on that edge)."""
     geoms = [e["geom"] for e in edges]
     tree = STRtree(geoms)
     spots = {}
@@ -471,14 +543,14 @@ def station_spots(stations, edges, rank):
         g = geoms[i]
         d = g.project(pt)
         h = heading_at(g, d)
-        base = np.array(g.interpolate(d).coords[0])
-        spots[sid] = (i, base, np.array([math.cos(h), math.sin(h)]), s["lines"] & edges[i]["lines"])
+        spots[sid] = (i, np.array(g.interpolate(d).coords[0]), np.array([math.cos(h), math.sin(h)]),
+                      s["lines"] & edges[i]["lines"])
     return spots
 
 
 # ---------------------------------------------------------------- render
-def render(edges, order, stations, line_cfg, date, out):
-    rank = {l: k for k, l in enumerate(order)}
+def render(edges, orders, stations, line_cfg, date, out):
+    order = sorted({l for e in edges for l in e["lines"]})
     limits = gpd.read_file(LIMITS).to_crs(CRS)
     x0, y0, x1, y1 = limits.total_bounds
     x0, y0, x1, y1 = x0 - 300, y0 - 300, x1 + 300, y1 + 300
@@ -511,23 +583,30 @@ def render(edges, order, stations, line_cfg, date, out):
 
     colors = {l: c for l, c in zip([g[0] for g in line_cfg["groups"]], line_cfg["colors"])}
     drawn = []                                    # drawn lines / capsules (map metres), kept clear of labels
-    for l in reversed(order):
-        for c in line_chains(l, edges, rank):
-            c = np.asarray(c)
+    paths = defaultdict(list)                     # line -> drawn LineStrings
+    line_ends = []                                # (line, end point, direction pointing out of the line)
+    for l in order:
+        for seq in chain_seqs(l, edges):
+            c = draw_path(seq, l, edges, orders)
+            if len(c) < 2:
+                continue
             ax.plot(c[:, 0], c[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
                     solid_joinstyle="round", zorder=3)
-            drawn.append(LineString(c))
-
-    # where each line ends: a terminus bar across its lane, and the stop there gets a name
-    inc = defaultdict(list)
-    for i, e in enumerate(edges):
-        for l in e["lines"]:
-            inc[(l, e["u"])].append(i)
-            inc[(l, e["v"])].append(i)
-    line_ends = [(l, np.array(n), es[0]) for (l, n), es in inc.items() if len(es) == 1]
+            g = LineString(c)
+            drawn.append(g)
+            paths[l].append(g)
+            # chain ends at nodes where the line has a single edge are line ends
+            for end_i, (i, fwd), node_key in ((0, seq[0], "u"), (-1, seq[-1], "v")):
+                e = edges[i]
+                node = e[node_key] if fwd else e["v" if node_key == "u" else "u"]
+                if sum(1 for e2 in edges if l in e2["lines"] and node in (e2["u"], e2["v"])) == 1:
+                    k = 0 if end_i == 0 else len(c) - 1
+                    k2 = min(len(c) - 1, 4) if end_i == 0 else max(0, len(c) - 5)
+                    d = c[k] - c[k2]
+                    line_ends.append((l, c[k], d / max(np.hypot(*d), 1e-9)))
 
     # stops, interchanges, labels (one name per stop name without the post number)
-    spots = station_spots(stations, edges, rank)
+    spots = station_spots(stations, edges)
     halo = [patheffects.withStroke(linewidth=4, foreground=LAND)]
     m_per_pt = 1 / pt_per_m
     base_name = lambda n: re.sub(r"\s+\d+[A-Za-z]?(\s*\(.*\))?$", "", n).strip()  # noqa: E731
@@ -537,35 +616,49 @@ def render(edges, order, stations, line_cfg, date, out):
         ax.plot([p[0], q[0]], [p[1], q[1]], color="white", lw=lw * 0.85, solid_capstyle="round", zorder=5.1)
         drawn.append(LineString([p, q]))
 
+    def on_line(l, xy):
+        """Point of line l's drawing nearest xy (None if the line is not drawn near)."""
+        best = None
+        for g in paths.get(l, []):
+            d = g.distance(Point(xy))
+            if d < 3 * SPACING + 30 and (best is None or d < best[0]):
+                best = (d, np.array(g.interpolate(g.project(Point(xy))).coords[0]))
+        return None if best is None else best[1]
+
     # stations at line ends (within 200 m of the end, served by that line) count as termini of that line
     ends_at = defaultdict(set)
-    for l, xy, i in line_ends:
+    for l, xy, d in line_ends:
         cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 200]
         if cand:
             ends_at[min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))].add(l)
-        g = edges[i]["geom"]
-        at_start = np.hypot(*(np.array(g.coords[0]) - xy)) < 1
-        h = heading_at(g, 0 if at_start else g.length)
-        nrm = np.array([-math.sin(h), math.cos(h)])
-        p = xy + nrm * lane_offset(edges[i], l, rank)
-        capsule(p - nrm * SPACING * 0.5, p + nrm * SPACING * 0.5)
+        # no end bar where the line turns at an interchange that gets its own capsule (Dworzec PKP spur)
+        if any((s_["name"] in KEY_STATIONS or len(s_["lines"]) >= MIN_INTERCHANGE) and np.hypot(*(s_["xy"] - xy)) < 80
+               for s_ in stations.values()):
+            continue
+        nrm = np.array([-d[1], d[0]])
+        capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
 
     requests = []                                 # labels to place
     for sid, (i, base, t, ls) in spots.items():
-        s = stations[sid]
+        st_ = stations[sid]
         nrm = np.array([-t[1], t[0]])
-        term = s["term"] | ends_at.get(sid, set())
-        big = s["name"] in KEY_STATIONS or len(s["lines"]) >= MIN_INTERCHANGE or term
+        term = st_["term"] | ends_at.get(sid, set())
+        big = st_["name"] in KEY_STATIONS or len(st_["lines"]) >= MIN_INTERCHANGE or term
         if not big:
-            for o in [lane_offset(edges[i], l, rank) for l in ls]:
-                p = base + nrm * o
-                ax.scatter([p[0]], [p[1]], s=(lw * 0.7) ** 2, color=INK, zorder=4, linewidths=0)
+            for l in ls:
+                p = on_line(l, base)
+                if p is not None:
+                    ax.scatter([p[0]], [p[1]], s=(lw * 0.7) ** 2, color=INK, zorder=4, linewidths=0)
             continue
-        all_offs = [lane_offset(edges[i], l, rank) for l in edges[i]["lines"]]
-        lo, hi = min(all_offs) - SPACING * 0.55, max(all_offs) + SPACING * 0.55
-        capsule(base + nrm * lo, base + nrm * hi)
-        prio = 0 if s["name"] in KEY_STATIONS else 1 if len(s["lines"]) >= MIN_INTERCHANGE else 2
-        requests.append((prio, -len(s["lines"]), sid, base, max(abs(lo), abs(hi)), sorted(term, key=rank.get)))
+        pts_ = [p for p in (on_line(l, base) for l in edges[i]["lines"]) if p is not None]
+        if not pts_:
+            continue
+        side = [float(np.dot(p - base, nrm)) for p in pts_]
+        lo, hi = min(side) - SPACING * 0.55, max(side) + SPACING * 0.55
+        mid = base + nrm * 0  # the capsule crosses the drawn lines on the normal through the stop
+        capsule(mid + nrm * lo, mid + nrm * hi)
+        prio = 0 if st_["name"] in KEY_STATIONS else 1 if len(st_["lines"]) >= MIN_INTERCHANGE else 2
+        requests.append((prio, -len(st_["lines"]), sid, base, max(abs(lo), abs(hi)), sorted(term)))
 
     # label placement: 16 candidates round the stop, scored by overlap with lines, capsules and placed labels
     occ = [g.buffer(lw * m_per_pt / 2 + 4) for g in drawn]
@@ -647,11 +740,10 @@ def main():
     geoms, n_shape, line_of, stations, line_trips = load(args.date)
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
-    edges = repair_lines(build_edges(pieces, sets), geoms, line_of)
+    edges = contract_short(repair_lines(build_edges(pieces, sets), geoms, line_of))
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
-    order, n_cross = best_order(sorted(line_trips.index), edges, args.seed)
-    print(f"line order {''.join(order)}, crossings {n_cross}")
-    render(edges, order, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
+    orders = best_orders(sorted(line_trips.index), edges, args.seed)
+    render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
 
 
 if __name__ == "__main__":
