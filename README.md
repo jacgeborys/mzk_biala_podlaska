@@ -11,11 +11,16 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `convert_to_gtfs.py` | Raw export -> GTFS |
 | `data/gtfs/`, `data/gtfs.zip` | Generated feed |
 | `export_gis.py` | GTFS -> GeoPackage + network diagram |
-| `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line) |
+| `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line), `segments` (cartogram: trips / lines per street piece, from `cartogram.py`) |
 | `png/network_diagram.png` | Quick network diagram (line colours, termini labels, trip counts in legend) |
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
+| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes, both directions) |
+| `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed) |
+| `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
+| `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
+| `png/bus_network_{full,city_limits}.png` | Subway-style bus network, made by subway_like_map (see below) |
 | `data/qa/shape_legs.csv` | Per stop-to-stop leg: straight-line vs routed distance (shape QA) |
 | `data/cache/` | OSM road graph + Overpass cache (git-ignored, re-downloaded if missing) |
 | `data/validation/` | MobilityData validator report (git-ignored) |
@@ -29,6 +34,7 @@ python convert_to_gtfs.py --no-shapes   # skip OSM routing
 python export_gis.py                 # GeoPackage + diagram (after the conversion)
 python animate_buses.py --still 07:30   # one preview frame
 python animate_buses.py              # video: 18.11.2026 04:30-23:30 in 120 s, 30 fps (~3600 frames)
+python cartogram.py [--city]         # flow cartogram (+ gpkg layer segments)
 java -jar tools/gtfs-validator-cli.jar -i data/gtfs.zip -o data/validation -c pl
 ```
 Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the validator.
@@ -87,7 +93,27 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 - Animation: `animate_buses.py` (own implementation; positions interpolated on `shape_dist_traveled`, style after
   gtfs_schedules_city: black page, dark basemap, outlined dots with trails). Wednesday 18.11.2026: 474 trips, 23 buses
   on the road at 07:30.
-- **Scope rule**: everything stays in this repo. Sibling projects (TransitFrequency, subway_like_map,
-  gtfs_schedules_city, osm_basemap) are references only; an attempt to add the city there was reverted (2026-11-16).
-- Next: frequency / accessibility analysis and a network map, implemented here. Feed expires 31.12.2026 — analyses
-  must use a date inside that window; a new export will be needed for 2027.
+- Cartogram (`cartogram.py`): busiest street Narutowicza / Al. Jana Pawła II, 363 buses/day both directions
+  (lines A B C D E F H I L). Counting per noded piece of the shape union (vertex-pair keys gave beads near stops,
+  where each variant's shape is cut at its own stop post).
+
+## Maps made in the sibling projects (edited in place with the user's OK, 2026-11-16)
+
+Other projects are only changed for a reason and with the user's OK; their outputs are copied / written here.
+- **TransitFrequency** (`D:\QGIS\TransitFrequency`, commits 187d9b5, ab3a8e4): city `bialapodlaska` in
+  `script/cities.py` (reads `data/gtfs.zip` here + PolRegio/IC trains), `python script/run_city.py --city bialapodlaska
+  --date 20261118` (6 min), poster `python script/render_poster.py --city bialapodlaska --date 18.11.2026 --dpi 300
+  --out D:/QGIS/gtfs_biala_podlaska/png/biala_podlaska_5min_departures_20261118.png`. Two Biała-specific settings:
+  `implicit_front_gate_m: 30` (detached-house blocks are mapped as one perimeter fence without gates, e.g. Orzechowa:
+  1,817 houses get the walk area within 30 m, as through their front gate) and own colour classes 1..400+ (buildings
+  reach at most ~205 departures). Stop check: Brzegowa - Baza (depot) and Ekologiczna gated, Czosnówka 4 ~100 m off
+  the walk network; all minor. Rerun after a new feed: `run_city.py ... --from gtfs`.
+- **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): cities `bialapodlaska` and
+  `bialapodlaska_city` (clipped to `data/gis/city_limits.gpkg`); `CITY=<c> python scripts/01_extract_trams.py`, 02, `03 1
+  300000 3`, `04_render.py --poster --dpi 150 --labels key --branch-bullets --stop-scale 0.85 --out png/...`
+  (Python: `D:\QGIS\gtfs_schedules_cityenv`). Draft quality: legend text from the busiest pattern (G and H look
+  alike), station bars at some ordinary stops.
+- The basemap in `data/basemap/` is a copy of `D:\QGIS\osm_basemapialapodlaska` (made by TransitFrequency).
+
+- Next: polish the subway-style map (legend texts, stations), maybe 10-min walk variant; feed expires
+  31.12.2026 — a new export will be needed for 2027.
