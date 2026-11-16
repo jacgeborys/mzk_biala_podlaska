@@ -112,9 +112,10 @@ def load(date):
 # ---------------------------------------------------------------- 1-2: corridors and graph
 def self_fold(p, step=5.0):
     """Line p without the stretches where it runs back along itself (within DUP_M of its own course at least
-    60 m earlier, for more than 3 * DUP_M): an out-and-back or loop shape keeps one copy of the street."""
+    2 * DUP_M earlier, for more than 3 * DUP_M; no street comes that close to itself, a hairpin does at once): an
+    out-and-back or loop shape keeps one copy of the street, up to its turning point."""
     ds = np.arange(0, p.length, step)
-    dup = np.array([s > 60 and substring(p, 0, s - 60).distance(p.interpolate(s)) <= DUP_M for s in ds])
+    dup = np.array([s > 2 * DUP_M and substring(p, 0, s - 2 * DUP_M).distance(p.interpolate(s)) <= DUP_M for s in ds])
     if not dup.any():
         return [p]
     keep, a = [], 0.0
