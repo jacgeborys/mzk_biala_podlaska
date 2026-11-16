@@ -752,26 +752,32 @@ def render(edges, orders, stations, line_cfg, date, out):
                 best = (d, np.array(g.interpolate(g.project(Point(xy))).coords[0]))
         return None if best is None else best[1]
 
-    # stations at line ends (within 200 m of the end, served by that line) count as termini of that line
-    ends_at = defaultdict(set)
+    # line ends: at a main terminus of the line an end bar, at the end of an extended variant a white diamond
+    ends_at = defaultdict(set)                    # station -> lines whose drawing ends there
     for l, xy, d in line_ends:
-        cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 200]
-        if cand:
-            ends_at[min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))].add(l)
-        # no end bar where the line turns at an interchange that gets its own capsule (Dworzec PKP spur)
-        if any((s_["name"] in KEY_STATIONS or len(s_["lines"]) >= MIN_INTERCHANGE) and np.hypot(*(s_["xy"] - xy)) < 80
-               for s_ in stations.values()):
+        cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 250]
+        k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy))) if cand else None
+        if k is not None:
+            ends_at[k].add(l)
+        # no end mark where the line turns at Dworzec PKP (it gets its own capsule)
+        if any(s_["name"] in KEY_STATIONS and np.hypot(*(s_["xy"] - xy)) < 80 for s_ in stations.values()):
             continue
-        nrm = np.array([-d[1], d[0]])
-        capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
+        if k is not None and l in stations[k]["term"]:
+            nrm = np.array([-d[1], d[0]])
+            capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
+        else:
+            ax.scatter([xy[0]], [xy[1]], marker="D", s=(lw * 1.45) ** 2, facecolor="white",
+                       edgecolor=colors.get(l, "#888"), linewidths=lw * 0.38, zorder=5.2)
+            drawn.append(Point(xy).buffer(SPACING * 0.6))
 
+    # names: termini only (main termini of a line, and Dworzec PKP); every other stop is a dot on its lines
     requests = []                                 # labels to place
+    cap_r = lw * 1.3 / 2 * m_per_pt
     for sid, (i, base, t, ls) in spots.items():
         st_ = stations[sid]
         nrm = np.array([-t[1], t[0]])
-        term = st_["term"] | ends_at.get(sid, set())
-        big = st_["name"] in KEY_STATIONS or len(st_["lines"]) >= MIN_INTERCHANGE or term
-        if not big:
+        key_st = st_["name"] in KEY_STATIONS
+        if not (st_["term"] or key_st):
             for l in ls:
                 p = on_line(l, base)
                 if p is not None:
@@ -782,47 +788,57 @@ def render(edges, orders, stations, line_cfg, date, out):
             continue
         side = [float(np.dot(p - base, nrm)) for p in pts_]
         lo, hi = min(side) - SPACING * 0.55, max(side) + SPACING * 0.55
-        mid = base + nrm * 0  # the capsule crosses the drawn lines on the normal through the stop
-        capsule(mid + nrm * lo, mid + nrm * hi)
-        prio = 0 if st_["name"] in KEY_STATIONS else 1 if len(st_["lines"]) >= MIN_INTERCHANGE else 2
-        requests.append((prio, -len(st_["lines"]), sid, base, max(abs(lo), abs(hi)), sorted(term)))
+        capsule(base + nrm * lo, base + nrm * hi)
+        zone = LineString([base + nrm * lo, base + nrm * hi]).buffer(cap_r + 5)
+        bullets = sorted(st_["term"] | (ends_at.get(sid, set()) if key_st else set()))
+        requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
-    # label placement: 16 candidates round the stop, scored by overlap with lines, capsules and placed labels
+    # label placement: as close to the stop as possible (16 directions, sliding outwards from the capsule),
+    # off other names at any cost, off the lines where that costs little distance
     occ = [g.buffer(lw * m_per_pt / 2 + 4) for g in drawn]
     occ_tree = STRtree(occ)
     placed = []
     labelled = set()
-    for prio, _, sid, base, half, bullets in sorted(requests, key=lambda r: (r[0], r[1])):
+    for prio, _, sid, base, zone, bullets in sorted(requests, key=lambda r: (r[0], r[1])):
         name = base_name(stations[sid]["name"])
         if name in labelled:
             continue
         labelled.add(name)
-        size = 14 if prio == 0 else 13 if prio == 1 else 11.5
+        size = 14 if prio == 0 else 12.5
         w_m = len(name) * size * 0.52 * m_per_pt
         h_m = size * 1.25 * m_per_pt
         if bullets:
             w_m = max(w_m, len(bullets) * 15 * m_per_pt)
             h_m += 17 * m_per_pt
         best = None
-        for dist in (half + SPACING * 1.3, half + SPACING * 3.0):
-            for ang in range(0, 360, 45):
-                v = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
+        for ang in range(0, 360, 22):
+            v = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
+            first = None
+            for dist in np.arange(0, 200, 5.0):
+                if first is not None and dist > first + 40:
+                    break                                  # at most 40 m past the closest clear spot
                 anchor = base + v * dist
                 bx0 = anchor[0] if v[0] > 0.3 else anchor[0] - w_m if v[0] < -0.3 else anchor[0] - w_m / 2
                 top = anchor[1] + (h_m if v[1] > 0.3 else h_m / 2 if abs(v[1]) <= 0.3 else 0)
                 bb = box(bx0, top - h_m, bx0 + w_m, top)
+                if bb.intersects(zone):
+                    continue
+                first = dist if first is None else first
                 hit = sum(occ[k].intersection(bb).area for k in occ_tree.query(bb))
-                hit += sum(q.intersection(bb).area for q in placed) * 10
-                score = hit + dist * 0.01
+                hit += sum(q.buffer(10).intersection(bb).area for q in placed) * 100
+                score = hit + dist * 25
                 if best is None or score < best[0]:
-                    best = (score, bb, top)
-        _, bb, top = best
+                    best = (score, bb, top, "left" if v[0] > 0.3 else "right" if v[0] < -0.3 else "center")
+        _, bb, top, ha = best
         placed.append(bb)
         ty = top - size * 0.62 * m_per_pt
-        ax.text(bb.bounds[0], ty, name, fontproperties=font(size), color=INK, ha="left", va="center",
-                path_effects=halo, zorder=7)
+        # text aligned towards the stop: a name left of its stop ends at the stop's side of the box
+        tx = {"left": bb.bounds[0], "right": bb.bounds[2], "center": (bb.bounds[0] + bb.bounds[2]) / 2}[ha]
+        ax.text(tx, ty, name, fontproperties=font(size), color=INK, ha=ha, va="center", path_effects=halo, zorder=7)
+        row_w = len(bullets) * 15 * m_per_pt
+        bx0 = {"left": tx, "right": tx - row_w, "center": tx - row_w / 2}[ha]
         for k, l in enumerate(bullets):     # lines ending here: bullets under the name
-            bx = bb.bounds[0] + (k * 15 + 7) * m_per_pt
+            bx = bx0 + (k * 15 + 7) * m_per_pt
             by = ty - (size * 0.62 + 9) * m_per_pt
             ax.scatter([bx], [by], s=13 ** 2, color=colors.get(l, "#888"), zorder=7, linewidths=0)
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
