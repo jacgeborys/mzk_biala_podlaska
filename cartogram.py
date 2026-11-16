@@ -183,7 +183,7 @@ def scale_max(pieces):
     return int(n[o][np.searchsorted(cum, SCALE_PCTL / 100)])
 
 
-def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
+def draw(pieces, n_trips, date, frame, out, limits=None, caps="round", cap=True):
     w, h = frame[2] - frame[0], frame[3] - frame[1]
     map_w = PAGE_W_IN - 2 * MARGIN_IN
     map_h = map_w * h / w
@@ -217,7 +217,7 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
 
     pieces = sorted(pieces, key=lambda p: p[1])  # busiest drawn last, on top
     n = np.array([p[1] for p in pieces])
-    vmax = scale_max(pieces)
+    vmax = scale_max(pieces) if cap else int(max(p[1] for p in pieces))
     top = int(n.max())
     if caps == "flat":
         # runs of equal count merged into continuous lines, flat ends: width steps meet squarely and branches
@@ -236,15 +236,30 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
                                          colors=[color_of(v, vmax) for v in vals], capstyle="butt",
                                          joinstyle="round", zorder=3))
     else:
-        # every piece where it is (stays connected); a carriageway of a divided road gets a filler copy shifted
-        # halfway towards the other one, so both carriageways and the gap between them read as one street
+        # every piece where it is (stays connected), flat ends: round caps on hundreds of short pieces bulge
+        # wherever the width changes. Bends are closed by a dot at each joint, as wide as the thinnest piece
+        # meeting there (fills the notch, never sticks out of a thicker line); dead ends stay flat.
+        # A carriageway of a divided road gets a filler copy shifted halfway towards the other one, so both
+        # carriageways and the gap between them read as one street.
         segs = [list(p[0].coords) for p in pieces]
         segs += [list(translate(p[0], p[3][0] / 2, p[3][1] / 2).coords) for p in pieces if p[3] is not None]
         vals = np.concatenate([n, [p[1] for p in pieces if p[3] is not None]])
+        joint = defaultdict(list)
+        for c, v in zip(segs, vals):
+            for end in (c[0], c[-1]):
+                joint[(round(end[0], 1), round(end[1], 1))].append(v)
+        jx, jv = [], []
+        for xy, vs in joint.items():
+            if len(vs) > 1:
+                jx.append(xy)
+                jv.append(min(vs))
+        jx, jv = np.array(jx), np.array(jv)
+        ax.scatter(jx[:, 0], jx[:, 1], s=width_of(jv, vmax) ** 2, c=[color_of(v, vmax) for v in jv],
+                   linewidths=0, zorder=3)
         order = np.argsort(vals, kind="stable")
         ax.add_collection(LineCollection([segs[i] for i in order], linewidths=width_of(vals[order], vmax),
-                                         colors=[color_of(v, vmax) for v in vals[order]], capstyle="round",
-                                         joinstyle="round", zorder=3))
+                                         colors=[color_of(v, vmax) for v in vals[order]], capstyle="butt",
+                                         joinstyle="round", zorder=3.1))
 
     # header (as TransitFrequency's draw_headline: city name two rows tall, question + date beside it)
     halo = [patheffects.withStroke(linewidth=6, foreground=PAGE, alpha=0.55)]
@@ -281,7 +296,7 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
     lax.text(0.15, lh_in - 0.12, "Autobusy/doba", ha="left", va="top", fontproperties=bahn(13), color=INK)
     for i, v in enumerate(ticks):
         y = lh_in - 0.62 - i * row_in
-        lax.plot([0.18, 1.05], [y, y], lw=width_of(v, vmax), color=color_of(v, vmax), solid_capstyle="round")
+        lax.plot([0.18, 1.05], [y, y], lw=width_of(v, vmax), color=color_of(v, vmax), solid_capstyle="butt")
         label = f"{v}" if v < vmax else (f"{v}+" if top > vmax else f"{v}  (maks.)")
         lax.text(1.3, y, label, ha="left", va="center",
                  fontproperties=bahn(12), color=INK)
@@ -312,6 +327,7 @@ def main():
     ap.add_argument("--date", default="20261118")
     ap.add_argument("--city", action="store_true", help="frame on the city limits (+400 m) instead of all stops")
     ap.add_argument("--caps", choices=["round", "flat"], default="round", help="line ends: round pieces or flat runs")
+    ap.add_argument("--no-cap", action="store_true", help="scale widths to the real maximum (the PKP spur) instead of the 99.5th percentile")
     ap.add_argument("--out", help="output PNG (default png/cartogram_<date>[_city].png)")
     args = ap.parse_args()
 
@@ -324,9 +340,9 @@ def main():
     if args.city:
         limits = gpd.read_file(LIMITS).to_crs(CRS)
         x0, y0, x1, y1 = limits.total_bounds
-        draw(pieces, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits, args.caps)
+        draw(pieces, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits, args.caps, not args.no_cap)
     else:
-        draw(pieces, n_trips, args.date, FRAME_ALL, out, caps=args.caps)
+        draw(pieces, n_trips, args.date, FRAME_ALL, out, caps=args.caps, cap=not args.no_cap)
 
 
 if __name__ == "__main__":

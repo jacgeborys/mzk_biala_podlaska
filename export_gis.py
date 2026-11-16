@@ -6,10 +6,11 @@ Output:
     stations  - parent stations (NR_PRZYST groups)
     variants  - one connected LineString per shape (line variant), with trip counts
     lines     - one merged geometry per line (all its variants)
-  png/network_diagram.png
+  png/network_diagram.png (only with --png: quick preview; the poster is diagram.py)
 
-Usage:  python export_gis.py
+Usage:  python export_gis.py [--png]
 """
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -88,7 +89,8 @@ def main():
         print(f"  {name:9s} {len(gdf):4d} features")
     print(f"written {GPKG}")
 
-    render(lines, variants, stations)
+    if "--png" in sys.argv:  # quick preview; the poster is diagram.py
+        render(lines, variants, stations)
 
 
 def render(lines, variants, stations):

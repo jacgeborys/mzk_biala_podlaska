@@ -12,16 +12,17 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `data/gtfs/`, `data/gtfs.zip` | Generated feed |
 | `export_gis.py` | GTFS -> GeoPackage + network diagram |
 | `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line), `segments` (cartogram: trips / lines per street piece, from `cartogram.py`) |
-| `png/network_diagram.png` | Quick network diagram (line colours, termini labels, trip counts in legend) |
+| `png/network_diagram.png` | Quick preview, only with `python export_gis.py --png` |
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
-| `cartogram.py` | Flow cartogram (`--caps flat` = merged runs with flat ends: tried for a branching look, worse than the default round ends): street pieces as thick as the buses per day passing them, both directions (noded union of all shapes; every pass of a shape parallel within 20 m, or within 45 m on the same named OSM street, counts, so a loop using both carriageways or the out-and-back Dworzec PKP spur counts twice; such pieces stay in place (connected) and get a filler copy shifted halfway towards the other carriageway, so divided roads like Armii Krajowej read as one band; beyond 2 m only passes on the same street count, street = OSM ref else name, since DK2's carriageways are partly named Białka, partly unnamed, all ref 2; close parallel streets like Chłodna / Twarda stay apart); widths top out at the 99.5th length percentile (363) so the 150 m spur to the station (633 passes) does not thin everything else; TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
+| `cartogram.py` | Flow cartogram (`--caps flat` = merged runs with flat ends: tried for a branching look, worse than the default round ends): street pieces as thick as the buses per day passing them, both directions (noded union of all shapes; every pass of a shape parallel within 20 m, or within 45 m on the same named OSM street, counts, so a loop using both carriageways or the out-and-back Dworzec PKP spur counts twice; such pieces stay in place (connected) and get a filler copy shifted halfway towards the other carriageway, so divided roads like Armii Krajowej read as one band; beyond 2 m only passes on the same street count, street = OSM ref else name, since DK2's carriageways are partly named Białka, partly unnamed, all ref 2; close parallel streets like Chłodna / Twarda stay apart); widths top out at the 99.5th length percentile (363) so the 150 m spur to the station (633 passes, real: every bus serving Dworzec PKP drives it in and out) does not thin everything else (`--no-cap` tried: the rest turns thin and dark); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
 | `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed) |
 | `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
 | `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
-| `png/bus_network_{city,full}.png` | Bus network diagram (one colour per line, bundled lines), made by subway_like_map with `config/diagram_lines.json` (see below); `city` = zoomed to the city limits, lines not trimmed |
-| `config/diagram_lines.json` | Diagram colours and legend names: every line its own family (`groups` / `names` / `colors`, read by subway_like_map's `--groups`) |
+| `diagram.py` | Bus network poster built for a small town: corridors from the day's shapes (directions / carriageways / variants within 35 m folded), lines bundled side by side in one global order (annealing on junction crossings), drawn as continuous offset chains with rounded corners; black stop dots, white capsules + names at interchanges (5+ lines), main termini (with line bullets) and Dworzec PKP (drawn as the real spur) |
+| `png/bus_network_city.png` | The poster (zoomed to the city limits, lines not trimmed) |
+| `config/diagram_lines.json` | Diagram colours and legend names per line |
 | `data/qa/shape_legs.csv` | Per stop-to-stop leg: straight-line vs routed distance (shape QA) |
 | `data/cache/` | OSM road graph + Overpass cache (git-ignored, re-downloaded if missing) |
 | `data/validation/` | MobilityData validator report (git-ignored) |
@@ -35,7 +36,8 @@ python convert_to_gtfs.py --no-shapes   # skip OSM routing
 python export_gis.py                 # GeoPackage + diagram (after the conversion)
 python animate_buses.py --still 07:30   # one preview frame
 python animate_buses.py              # video: 18.11.2026 04:30-23:30 in 120 s, 30 fps (~3600 frames)
-python cartogram.py [--city]         # flow cartogram (+ gpkg layer segments)
+python cartogram.py [--city] [--no-cap]   # flow cartogram (+ gpkg layer segments); --no-cap: widths to the true max
+python diagram.py                    # network poster -> png/bus_network_city.png
 java -jar tools/gtfs-validator-cli.jar -i data/gtfs.zip -o data/validation -c pl
 ```
 Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the validator.
@@ -114,17 +116,9 @@ Other projects are only changed for a reason and with the user's OK; their outpu
   1,817 houses get the walk area within 30 m, as through their front gate) and own colour classes: 25 linear classes
   1..205 (205 = the actual maximum, 61 buildings), `--min-lightness 50` so the lowest blues are less dark. Stop check: Brzegowa - Baza (depot) and Ekologiczna gated, Czosnówka 4 ~100 m off
   the walk network; all minor. Rerun after a new feed: `run_city.py ... --from gtfs`.
-- **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): city `bialapodlaska`
-  (`bialapodlaska_city` = feed clipped to the city limits, not used any more: the user prefers zooming over
-  trimming). `CITY=bialapodlaska python scripts/01_extract_trams.py`, `02_build_network.py 1.0 0.35 15` (15 m simplification,
-  default 80 m was too coarse for a town), `03_order_lines.py 1 300000 3`,
-  then `04_render.py --poster --dpi 150 --nyc --labels key --stations topo --transfers none --complexes --stop-scale 0.85
-  --hub-scale 0.7 --platform-cap 40 --corner-radius 60 --joint-round 40 --spacing 25 --groups
-  D:/QGIS/gtfs_biala_podlaska/config/diagram_lines.json --extent 778420 466330 793200 474790 --out .../png/bus_network_city.png`
-  (full: `--spacing 35`, no `--extent`). Python: `D:\QGIS\gtfs_schedules_cityenv`.
-  Dworzec PKP: buses run in and out of the station spur off Al. Tysiąclecia without ending there; 02's
-  `spur_stations` (city.py) moves the station onto the junction so it is drawn as the interchange it is. The NYC family colours were
-  rejected (2026-11-16): one colour per line, tighter bundles, zoom to the city.
+- **subway_like_map**: used for the first network posters, then **reverted completely** (2026-11-16, user: Biała is far
+  smaller than the tram cities that renderer is tuned for; local revert commits 4b151d0..46c2cc0 there, its tree equals
+  30ae893 again). The diagram is now `diagram.py` in this repo.
 - Feed files and the GeoPackage are overwritten in place (QGIS keeps them open; deleting fails on Windows).
 - The basemap in `data/basemap/` is a copy of `D:\QGIS\osm_basemapialapodlaska` (made by TransitFrequency).
 
