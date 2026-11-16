@@ -16,7 +16,7 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
-| `cartogram.py` | Flow cartogram: street pieces as thick as the buses per day on them (noded union of all shapes; parallel shapes within 20 m, or within 45 m on the same named OSM street, counted together, so island splits and dual carriageways read as one street); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
+| `cartogram.py` | Flow cartogram (`--caps flat` = merged runs with flat ends: tried for a branching look, worse than the default round ends): street pieces as thick as the buses per day on them (noded union of all shapes; parallel shapes within 20 m, or within 45 m on the same named OSM street, counted together, so island splits and dual carriageways read as one street); TransitFrequency poster layout (Bahnschrift header, frame, scale bar, legend box) |
 | `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed) |
 | `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
 | `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
@@ -111,8 +111,8 @@ Other projects are only changed for a reason and with the user's OK; their outpu
   --date 20261118` (6 min), poster `python script/render_poster.py --city bialapodlaska --date 18.11.2026 --dpi 300
   --out D:/QGIS/gtfs_biala_podlaska/png/biala_podlaska_5min_departures_20261118.png`. Two Biała-specific settings:
   `implicit_front_gate_m: 30` (detached-house blocks are mapped as one perimeter fence without gates, e.g. Orzechowa:
-  1,817 houses get the walk area within 30 m, as through their front gate) and own colour classes 1..400+ (buildings
-  reach at most ~205 departures). Stop check: Brzegowa - Baza (depot) and Ekologiczna gated, Czosnówka 4 ~100 m off
+  1,817 houses get the walk area within 30 m, as through their front gate) and own colour classes: 25 linear classes
+  1..205 (205 = the actual maximum, 61 buildings), `--min-lightness 50` so the lowest blues are less dark. Stop check: Brzegowa - Baza (depot) and Ekologiczna gated, Czosnówka 4 ~100 m off
   the walk network; all minor. Rerun after a new feed: `run_city.py ... --from gtfs`.
 - **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): city `bialapodlaska`
   (`bialapodlaska_city` = feed clipped to the city limits, not used any more: the user prefers zooming over

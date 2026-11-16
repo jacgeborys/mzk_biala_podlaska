@@ -147,7 +147,7 @@ def color_of(v, vmax):
     return plt.get_cmap("plasma")(0.25 + 0.75 * np.sqrt(v / vmax))
 
 
-def draw(pieces, n_trips, date, frame, out, limits=None):
+def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
     w, h = frame[2] - frame[0], frame[3] - frame[1]
     map_w = PAGE_W_IN - 2 * MARGIN_IN
     map_h = map_w * h / w
@@ -182,9 +182,26 @@ def draw(pieces, n_trips, date, frame, out, limits=None):
     pieces = sorted(pieces, key=lambda p: p[1])  # busiest drawn last, on top
     n = np.array([p[1] for p in pieces])
     vmax = n.max()
-    ax.add_collection(LineCollection([list(p[0].coords) for p in pieces], linewidths=width_of(n, vmax),
-                                     colors=[color_of(v, vmax) for v in n], capstyle="round",
-                                     joinstyle="round", zorder=3))
+    if caps == "flat":
+        # runs of equal count merged into continuous lines, flat ends: width steps meet squarely and branches
+        # leave the trunk without the round bulbs every short piece gets with round caps
+        runs = defaultdict(list)
+        for g, v, _ in pieces:
+            runs[v].append(g)
+        segs, vals = [], []
+        for v in sorted(runs):
+            m = linemerge(runs[v])
+            for g in (m.geoms if hasattr(m, "geoms") else [m]):
+                segs.append(list(g.coords))
+                vals.append(v)
+        vals = np.array(vals)
+        ax.add_collection(LineCollection(segs, linewidths=width_of(vals, vmax),
+                                         colors=[color_of(v, vmax) for v in vals], capstyle="butt",
+                                         joinstyle="round", zorder=3))
+    else:
+        ax.add_collection(LineCollection([list(p[0].coords) for p in pieces], linewidths=width_of(n, vmax),
+                                         colors=[color_of(v, vmax) for v in n], capstyle="round",
+                                         joinstyle="round", zorder=3))
 
     # header (as TransitFrequency's draw_headline: city name two rows tall, question + date beside it)
     halo = [patheffects.withStroke(linewidth=6, foreground=PAGE, alpha=0.55)]
@@ -250,6 +267,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default="20261118")
     ap.add_argument("--city", action="store_true", help="frame on the city limits (+400 m) instead of all stops")
+    ap.add_argument("--caps", choices=["round", "flat"], default="round", help="line ends: round pieces or flat runs")
+    ap.add_argument("--out", help="output PNG (default png/cartogram_<date>[_city].png)")
     args = ap.parse_args()
 
     pieces, n_trips = piece_counts(args.date)
@@ -257,13 +276,13 @@ def main():
     seg.to_file(GPKG, layer="segments", driver="GPKG")
     print(f"segments: {len(seg)} lines, busiest {seg.trips.max()} buses/day "
           f"({seg.sort_values('trips').iloc[-1].lines}) -> {GPKG.name}:segments")
-    out = ROOT / "png" / f"cartogram_{args.date}{'_city' if args.city else ''}.png"
+    out = Path(args.out) if args.out else ROOT / "png" / f"cartogram_{args.date}{'_city' if args.city else ''}.png"
     if args.city:
         limits = gpd.read_file(LIMITS).to_crs(CRS)
         x0, y0, x1, y1 = limits.total_bounds
-        draw(pieces, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits)
+        draw(pieces, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits, args.caps)
     else:
-        draw(pieces, n_trips, args.date, FRAME_ALL, out)
+        draw(pieces, n_trips, args.date, FRAME_ALL, out, caps=args.caps)
 
 
 if __name__ == "__main__":
