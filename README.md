@@ -116,9 +116,10 @@ Other projects are only changed for a reason and with the user's OK; their outpu
   the walk network; all minor. Rerun after a new feed: `run_city.py ... --from gtfs`.
 - **subway_like_map** (`D:\QGIS\subway_like_map`, local commit 0b98e39, no remote): city `bialapodlaska`
   (`bialapodlaska_city` = feed clipped to the city limits, not used any more: the user prefers zooming over
-  trimming). `CITY=bialapodlaska python scripts/01_extract_trams.py`, `02_build_network.py`, `03_order_lines.py 1 300000 3`,
+  trimming). `CITY=bialapodlaska python scripts/01_extract_trams.py`, `02_build_network.py 1.0 0.35 15` (15 m simplification,
+  default 80 m was too coarse for a town), `03_order_lines.py 1 300000 3`,
   then `04_render.py --poster --dpi 150 --nyc --labels key --stations topo --transfers none --complexes --stop-scale 0.85
-  --hub-scale 0.7 --platform-cap 40 --corner-radius 100 --joint-round 60 --spacing 25 --groups
+  --hub-scale 0.7 --platform-cap 40 --corner-radius 60 --joint-round 40 --spacing 25 --groups
   D:/QGIS/gtfs_biala_podlaska/config/diagram_lines.json --extent 778420 466330 793200 474790 --out .../png/bus_network_city.png`
   (full: `--spacing 35`, no `--extent`). Python: `D:\QGIS\gtfs_schedules_cityenv`.
   Dworzec PKP: buses run in and out of the station spur off Al. Tysiąclecia without ending there; 02's
