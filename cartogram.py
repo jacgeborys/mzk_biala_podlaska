@@ -4,8 +4,9 @@ All shapes are noded into one network; each piece counts every pass of a shape r
 to it within MERGE_M (either direction), or within DUAL_M on the same named OSM street (a loop
 shape using both carriageways, or an out-and-back spur, counts twice), so both
 directions are summed and both carriageways of a divided road / both halves of a split around a
-traffic island carry the street's full count; such pieces are shifted halfway towards the other
-carriageway, so a divided road is drawn once, on its middle line. Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
+traffic island carry the street's full count; such pieces get a filler copy shifted halfway towards
+the other carriageway, so a divided road reads as one band. Beyond 2 m, parallel passes count only
+on the same street (OSM ref, else name), so close parallel streets (Chłodna / Twarda) stay apart. Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
 bar, legend box, credit line).
 
 Output: png/cartogram_<date>.png, layer `segments` in data/gis/biala_podlaska_gtfs.gpkg
@@ -100,9 +101,9 @@ def piece_counts(date):
     for piece in (noded.geoms if hasattr(noded, "geoms") else [noded]):
         mid = piece.interpolate(0.5, normalized=True)
         h = heading(piece, piece.length / 2)
-        name = None
+        key = street(mid)
         total, lines = 0, set()
-        other = None  # nearest pass on another carriageway (offset from the piece), to draw the street once
+        other = None  # nearest pass on the other carriageway of the same street (offset from the piece)
         for i in tree.query(mid.buffer(DUAL_M)):
             xy, hd = samples[i]
             dist = np.hypot(xy[:, 0] - mid.x, xy[:, 1] - mid.y)
@@ -112,31 +113,34 @@ def piece_counts(date):
             # one pass = a run of consecutive samples near the piece (a loop or an out-and-back shape passes twice)
             for run in np.split(near, np.flatnonzero(np.diff(near) > 1) + 1):
                 k = run[np.argmin(dist[run])]
-                if dist[k] > 1.0 + SAMPLE_M / 2:  # not the piece's own course: must run parallel ...
+                if dist[k] > 1.0 + SAMPLE_M / 2:  # not the piece's own course: a parallel carriageway ...
                     if abs((hd[k] - h + 90) % 180 - 90) > PARALLEL_DEG:
                         continue
-                    if dist[k] > MERGE_M:  # ... and beyond MERGE_M lie on the same named street
-                        name = street(mid) if name is None else name
-                        if not name or street(Point(xy[k])) != name:
-                            continue
+                    k_key = street(Point(xy[k]))
+                    same = bool(key) and k_key == key            # ... of the same street (ref, else name)
+                    unnamed_island = not key and not k_key and dist[k] <= MERGE_M
+                    if not (same or unnamed_island):
+                        continue
+                    if other is None or dist[k] < np.hypot(*other):
+                        other = (xy[k][0] - mid.x, xy[k][1] - mid.y)
                 total += int(n_shape[sids[i]])
                 lines.add(sids[i].split("_")[0])
-                if dist[k] > 2.0 and (other is None or dist[k] < np.hypot(*other)):
-                    other = (xy[k][0] - mid.x, xy[k][1] - mid.y)
         if total:
-            if other is not None:  # dual carriageway / island split: both halves move onto the middle line
-                piece = translate(piece, other[0] / 2, other[1] / 2)
-            pieces.append((piece, total, ",".join(sorted(lines))))
+            pieces.append((piece, total, ",".join(sorted(lines)), other))
     return pieces, len(day)
 
 
 def street_namer():
-    """Point -> OSM street name of the nearest drivable edge within 8 m ('' if none)."""
+    """Point -> street of the nearest drivable edge within 8 m: its road number (ref) if it has one, else its
+    name ('' if neither). DK2's carriageways are partly named Białka, partly unnamed, all ref 2."""
     import osmnx as ox
     from shapely.strtree import STRtree
     e = ox.graph_to_gdfs(ox.load_graphml(ROOT / "data" / "cache" / "osm_drive_service.graphml"), nodes=False)
-    e = e[e["name"].notna()].to_crs(CRS)
-    names = [n if isinstance(n, str) else "/".join(n) for n in e["name"]]
+    def key(ref, name):
+        v = ref if isinstance(ref, (str, list)) else name
+        return v if isinstance(v, str) else "/".join(v) if isinstance(v, list) else ""
+    e = e[e["name"].notna() | e["ref"].notna()].to_crs(CRS)
+    names = [key(r, n) for r, n in zip(e["ref"], e["name"])]
     lines = list(e.geometry)
     tree = STRtree(lines)
 
@@ -151,7 +155,7 @@ def street_namer():
 def merged_segments(pieces):
     """Join pieces with the same count and line set into longer LineStrings (for the gpkg)."""
     groups = defaultdict(list)
-    for g, n, ls in pieces:
+    for g, n, ls, _ in pieces:
         groups[(n, ls)].append(g)
     rows = []
     for (n, ls), segs in groups.items():
@@ -219,7 +223,7 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
         # runs of equal count merged into continuous lines, flat ends: width steps meet squarely and branches
         # leave the trunk without the round bulbs every short piece gets with round caps
         runs = defaultdict(list)
-        for g, v, _ in pieces:
+        for g, v, _, _ in pieces:
             runs[v].append(g)
         segs, vals = [], []
         for v in sorted(runs):
@@ -232,8 +236,14 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
                                          colors=[color_of(v, vmax) for v in vals], capstyle="butt",
                                          joinstyle="round", zorder=3))
     else:
-        ax.add_collection(LineCollection([list(p[0].coords) for p in pieces], linewidths=width_of(n, vmax),
-                                         colors=[color_of(v, vmax) for v in n], capstyle="round",
+        # every piece where it is (stays connected); a carriageway of a divided road gets a filler copy shifted
+        # halfway towards the other one, so both carriageways and the gap between them read as one street
+        segs = [list(p[0].coords) for p in pieces]
+        segs += [list(translate(p[0], p[3][0] / 2, p[3][1] / 2).coords) for p in pieces if p[3] is not None]
+        vals = np.concatenate([n, [p[1] for p in pieces if p[3] is not None]])
+        order = np.argsort(vals, kind="stable")
+        ax.add_collection(LineCollection([segs[i] for i in order], linewidths=width_of(vals[order], vmax),
+                                         colors=[color_of(v, vmax) for v in vals[order]], capstyle="round",
                                          joinstyle="round", zorder=3))
 
     # header (as TransitFrequency's draw_headline: city name two rows tall, question + date beside it)
