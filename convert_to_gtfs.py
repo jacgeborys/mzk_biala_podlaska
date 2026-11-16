@@ -37,8 +37,8 @@ ROAD_WEIGHTS = {
     "motorway": 1.0, "motorway_link": 1.0, "trunk": 1.0, "trunk_link": 1.0,
     "primary": 1.0, "primary_link": 1.0, "secondary": 1.0, "secondary_link": 1.0,
     "tertiary": 1.05, "tertiary_link": 1.05,
-    "unclassified": 1.1, "residential": 1.1,
-    "service": 1.5,
+    "unclassified": 1.1, "residential": 1.6,
+    "service": 2.0,
 }
 DEFAULT_ROAD_WEIGHT = 1.1
 EXCLUDED_ROADS = {"living_street"}

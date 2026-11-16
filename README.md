@@ -49,8 +49,10 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 - **Times**: arrival = departure = timetable minute, `timepoint=1`.
 - **Shapes**: one per variant (`<line>_<variant>`), map-matched on the OSM `drive_service` network
   (Viterbi over the 6 nearest edges within 60 m of each stop); one-ways respected. Cost = length × road class
-  weight (`ROAD_WEIGHTS`): primary/secondary/trunk 1.0, tertiary 1.05, residential/unclassified 1.1, service 1.5;
-  `living_street` excluded. Mild on purpose: only removes side-street shortcuts (19 of 102 shapes changed, max +124 m).
+  weight (`ROAD_WEIGHTS`): primary/secondary/trunk 1.0, tertiary 1.05, unclassified 1.1, residential 1.6,
+  service 2.0; `living_street` excluded. Keeps buses on tertiary-or-above roads unless a stop is on a residential
+  street (residential 1.1 -> 1.6 changed 69 of 102 shapes, typically +85-145 m; checked: C_j no longer U-turns on
+  Jana III Sobieskiego, G_h Brzeska -> Narutowicza now via Al. 1000-lecia instead of a residential street).
   `shape_dist_traveled` in metres in shapes and stop_times. All stops lie within ~31 m of their shape.
 - **Routes**: `route_type=3`, long name from the basic variant, colours assigned arbitrarily (`LINE_COLORS`).
 - Trip notes (`UWAGI_KURS`) are not exported; headsigns come from the variant. Seasonal notes do not affect this
@@ -58,8 +60,7 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
 
 ## Status (2026-11-16)
 
-- GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing now uses road class weights, living streets excluded.
-
+- GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing uses road class weights (residential 1.6), living streets excluded.
 - Feed built: 13 lines (A–M, T weekends only), 318 posts / 172 stations, 1249 trips, 25 613 stop times, 102 shapes;
   valid 10.11–31.12.2026.
 - MobilityData validator v8.0.1: **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`
