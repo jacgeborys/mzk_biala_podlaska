@@ -52,7 +52,9 @@ SIMPLIFY_M = 30     # sections are simplified this much before their corners are
 CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_SHARE = 0.25    # a line's section with under this share of the trips of its busiest section is an extension (dashed)
-STATION_DROP_M = 240  # Dworzec PKP: the through lines continue straight on this far past the station (schematic)
+U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
+U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
+U_TOP_M = 170        # ... over which the legs peel apart below the crossing
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -350,10 +352,12 @@ def edge_trips(edges, geoms, n_shape, line_of):
 
 
 def station_access(edges, stations):
-    """Dworzec PKP drawn schematically. In reality the buses run down Al. 1000-lecia to a dead end at the station
-    and turn back. The map shows a vertical station all the lines from the north pass straight through; below it
-    the bundle splits: lines that go on west (Sidorska west of Al. 1000-lecia) peel off to the left, lines that go
-    on east (to the roundabout at Al. Jana Pawła II) to the right. The real hairpins back up to Sidorska go."""
+    """Dworzec PKP drawn schematically as a U. In reality the buses run down Al. 1000-lecia from its crossing with
+    Sidorska to a dead end at the station and turn back; D, F and H leave along Kościuszki instead. On the map a
+    U hangs below the crossing: lines go down one leg, along the bottom through the station (a vertical bar
+    across them) and up the other leg back to the crossing, where they split north / west / east as their routes
+    do. Lines that leave along Kościuszki go straight on east from the U's bottom corner; lines that turn back at
+    the station without passing (B) end at the bar."""
     key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
     out = [e for e in edges if e["u"] != e["v"] and e["geom"].length >= 1]
     for name in KEY_STATIONS:
@@ -369,64 +373,66 @@ def station_access(edges, stations):
         d = g.project(Point(xy))
         if d < 50 or d > g.length - 50:
             continue
-        # the shorter leg from the station is the access road (Al. 1000-lecia), the longer one the road east
-        legs = [(g.interpolate(0), e["u"], [g.interpolate(x) for x in np.linspace(d, 0, 40)]),
-                (g.interpolate(g.length), e["v"], [g.interpolate(x) for x in np.linspace(d, g.length, 80)])]
-        legs.sort(key=lambda t: LineString(t[2]).length)
-        (_, N2, acc_pts), (_, N1, thr_pts) = legs
-        acc_c = np.array([p.coords[0] for p in acc_pts])[::-1]      # N2 -> station
-        thr_c = np.array([p.coords[0] for p in thr_pts])[::-1]      # N1 -> station
-        J = acc_c[-1]
-        dv = J - acc_c[0]
-        dv /= np.hypot(*dv)                                           # pointing down the access road
-        side = lambda q: np.sign(dv[0] * (q[1] - J[1]) - dv[1] * (q[0] - J[0]))  # noqa: E731
-        east_side = side(np.array(N1))
-        at = lambda n: [k for k, f in enumerate(out) if k != i and n in (f["u"], f["v"])]  # noqa: E731
-        far = lambda f, n: f["v"] if f["u"] == n else f["u"]  # noqa: E731
-        direct = [k for k in at(N2) if far(out[k], N2) == N1]        # Sidorska N2 - N1 (A's real way back)
-        west = [k for k in at(N2) if k not in direct and side(np.array(far(out[k], N2))) == -east_side
-                and abs(np.dot(dv, np.array(far(out[k], N2)) - np.array(N2)) /
-                        np.hypot(*(np.array(far(out[k], N2)) - np.array(N2)))) < 0.6]
-        north = [k for k in at(N2) if k not in direct and k not in west]
-        L = e["lines"]
-        west_lines = L & frozenset().union(*[out[k]["lines"] for k in west]) if west else frozenset()
-        east_lines = (L & frozenset().union(*[out[k]["lines"] for k in at(N1)])) - west_lines
-        north_lines = L & frozenset().union(*[out[k]["lines"] for k in north]) if north else L
-        trips = e.get("trips", {})
-        new = []
-        for k in west + direct:                                       # the hairpins' other halves go
-            ls = out[k]["lines"] - (west_lines if k in west else east_lines)
-            if ls:
-                new.append(dict(out[k], lines=ls))
-            if k in west:
-                W = far(out[k], N2)
-                west_trips = out[k].get("trips", {})
-        drop = STATION_DROP_M
-        chord = LineString([thr_c[0], thr_c[-1]])
-        kc = int(np.argmax([chord.distance(Point(p)) for p in thr_c]))
-        K = J + dv * drop                                             # the split, a straight stem below the station
-        thr_g = np.vstack([thr_c[:kc + 1], [thr_c[kc] + dv * drop, K]])
+        # the shorter leg from the station is the access road (Al. 1000-lecia), the longer one Kościuszki
+        legs = [(e["u"], [g.interpolate(x) for x in np.linspace(d, 0, 40)]),
+                (e["v"], [g.interpolate(x) for x in np.linspace(d, g.length, 80)])]
+        legs.sort(key=lambda t: LineString(t[1]).length)
+        (N2, acc_pts), (N1, thr_pts) = legs
+        thr_c = np.array([p.coords[0] for p in thr_pts])[::-1]      # roundabout -> station
+        P0 = np.array(N2)
+        dv = np.array(acc_pts[0].coords[0]) - P0
+        dv /= np.hypot(*dv)                                           # down the access road
         perp = np.array([-dv[1], dv[0]])
-        perp = perp if side(J + perp) == east_side else -perp           # towards the east side
-        for st in stations.values():                                  # stops on the road east follow it
-            if st["name"] != name and Point(st["xy"]).distance(LineString(thr_c)) < 40:
-                st["xy"] = st["xy"] + dv * drop * 0.5
+        side = lambda q: np.sign(dv[0] * (q[1] - P0[1]) - dv[1] * (q[0] - P0[0]))  # noqa: E731
+        if side(P0 + perp) != side(np.array(N1)):
+            perp = -perp                                              # towards Kościuszki (east)
+        # lines: those reaching Kościuszki (on the roundabout's other edges and not back on Sidorska) go on east
+        at = lambda n: [f for k, f in enumerate(out) if k != i and n in (f["u"], f["v"])]  # noqa: E731
+        L = e["lines"]
+        far = lambda f, n: f["v"] if f["u"] == n else f["u"]  # noqa: E731
+        direct = [f for f in at(N2) if far(f, N2) == N1]             # Sidorska straight to the roundabout
+        on_direct = frozenset().union(*[f["lines"] for f in direct]) if direct else frozenset()
+        n1_lines = frozenset().union(*[f["lines"] for f in at(N1) if f not in direct])
+        kos_lines = (L & n1_lines) - on_direct                        # leave along Kościuszki
+        end_lines = frozenset(l for l in L - kos_lines
+                              if sum(1 for f in at(N2) if l in f["lines"]) == 1)  # in and out the same street: end
+        u_lines = L - kos_lines - end_lines                           # round the U and back up
+        trips = e.get("trips", {})
+        tr = lambda ls: {l: trips.get(l, 0) for l in ls}  # noqa: E731
+        # the U, drawn as is (no simplification): legs peel apart from the crossing on S-curves, run straight
+        # down, and meet in a half circle whose lowest point is the station
+        C = P0 + dv * (U_DEPTH_M - U_HALF_M)
+        Sx = P0 + dv * U_DEPTH_M
+        ss = lambda t: t * t * (3 - 2 * t)  # noqa: E731
+        def leg(sign):
+            top = [P0 + dv * (U_TOP_M * t) + sign * perp * U_HALF_M * ss(t) for t in np.linspace(0, 1, 25)]
+            arc = [C + sign * perp * U_HALF_M * math.cos(a) + dv * U_HALF_M * math.sin(a)
+                   for a in np.linspace(0, math.pi / 2, 19)]
+            return [tuple(p) for p in top + arc]
+        down = u_lines | kos_lines | end_lines
+        keep = [f for k, f in enumerate(out) if k != i]
+        lg = leg(-1)
+        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
+                         trips=tr(down)))
+        if u_lines:
+            rg = leg(1)[::-1]
+            keep.append(dict(geom=LineString([tuple(Sx)] + rg[1:-1] + [N2]), lines=u_lines, u=key(Sx), v=N2,
+                             raw=True, trips=tr(u_lines)))
+        if kos_lines:
+            kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
+            corner = thr_c[kc]
+            turn = Sx + perp * max(float(np.dot(corner - Sx, perp)), U_HALF_M + 200)  # east along the bottom, then up
+            keep.append(dict(geom=LineString([tuple(Sx), tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1]),
+                             lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines)))
+            kos_g = keep[-1]["geom"]
+            for st in stations.values():                              # stops on Kościuszki follow it
+                if st["name"] != name and Point(st["xy"]).distance(LineString(thr_c)) < 40:
+                    st["xy"] = np.array(kos_g.interpolate(kos_g.project(Point(st["xy"]))).coords[0])
         for k_ in sts:
-            stations[k_]["xy"] = J + dv * 1.0
-        keep = [f for k, f in enumerate(out) if k != i and k not in west + direct]
-        keep.append(dict(geom=LineString([N2] + [tuple(p) for p in acc_c[1:-1]] + [tuple(J)]), lines=north_lines,
-                         u=N2, v=key(J), trips={l: trips.get(l, 0) for l in north_lines}))
-        stem = (north_lines & (east_lines | west_lines)) | east_lines | west_lines
-        keep.append(dict(geom=LineString([tuple(J), tuple(K)]), lines=stem, u=key(J), v=key(K),
-                         trips={l: max(trips.get(l, 0), west_trips.get(l, 0) if west_lines else 0) for l in stem}))
-        keep.append(dict(geom=LineString([N1] + [tuple(p) for p in thr_g[1:]]), lines=east_lines, u=N1, v=key(K),
-                         trips={l: trips.get(l, 0) for l in east_lines}))
-        if west_lines:
-            keep.append(dict(geom=LineString([W, tuple(K - perp * 200), tuple(K)]), lines=west_lines, u=W, v=key(K),
-                             trips={l: west_trips.get(l, 0) for l in west_lines}))
-        out = keep + new
-        print(f"{name}: from the north {sorted(north_lines)}, off to the west {sorted(west_lines)}, "
-              f"off to the east {sorted(east_lines)}")
+            stations[k_]["xy"] = Sx - perp * 1.0                     # on the leg every line uses
+        out = keep
+        print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
+              f"{sorted(end_lines)}")
     return out
 
 
@@ -587,6 +593,8 @@ def fillet(c, R):
 def section_coords(e, width):
     """An edge's centreline as drawn: simplified (SIMPLIFY_M), then bends inside it that are too tight for the
     bundle's width (a smaller arc would fold the inner lanes) removed, as subway_like_map does."""
+    if e.get("raw"):                              # drawn schematically already (Dworzec PKP)
+        return np.array(e["geom"].coords)
     c = np.array(e["geom"].simplify(SIMPLIFY_M).coords)
     rmin = (width - 1) / 2 * SPACING + 0.8 * SPACING
     while len(c) >= 3:
@@ -649,6 +657,27 @@ def chain_seqs(l, edges):
         if i not in used:
             chains.append(walk(edges[i]["u"], i))
     return chains
+
+
+def chain_node(step, edges, start):
+    """The node a chain starts (start=True) or ends at, given its first / last (edge, forward) step."""
+    i, fwd = step
+    e = edges[i]
+    return (e["u"] if fwd else e["v"]) if start else (e["v"] if fwd else e["u"])
+
+
+def lead_in(l, node, i, edges, inc_l, before):
+    """Line l's straightest continuation through node from section i, as a chain step (None if l ends there)."""
+    others = [j for j in inc_l[(l, node)] if j != i]
+    if not others:
+        return None
+
+    def away(j):
+        g = edges[j]["geom"]
+        return heading_at(g, 0) if edges[j]["u"] == node else heading_at(g, g.length) + math.pi
+    h = away(i)
+    j = min(others, key=lambda j: abs((away(j) - h - math.pi + math.pi) % (2 * math.pi) - math.pi))
+    return (j, edges[j]["v"] == node) if before else (j, edges[j]["u"] == node)
 
 
 _SECTIONS = {}
@@ -745,6 +774,11 @@ def render(edges, orders, stations, line_cfg, date, out):
     limits.boundary.plot(ax=ax, color="#9a9a9a", linewidth=1.0, linestyle=(0, (5, 4)), zorder=1.5, aspect=None)
 
     colors = {l: c for l, c in zip([g[0] for g in line_cfg["groups"]], line_cfg["colors"])}
+    inc_l = defaultdict(list)                     # (line, node) -> sections of the line there
+    for i, e in enumerate(edges):
+        for l in e["lines"]:
+            inc_l[(l, e["u"])].append(i)
+            inc_l[(l, e["v"])].append(i)
     line_max = defaultdict(int)                   # trips on each line's busiest section
     for e in edges:
         for l, n in e.get("trips", {}).items():
@@ -754,7 +788,25 @@ def render(edges, orders, stations, line_cfg, date, out):
     line_ends = []                                # (line, end point, direction pointing out of the line)
     for l in order:
         for seq in chain_seqs(l, edges):
-            c, E = draw_path(seq, l, edges, orders)
+            # a chain ending at a junction where the line goes on along other sections (a branch, a crossing of its
+            # own) is drawn with a lead-in of its straightest continuation: it eases out of that lane, no gap
+            pre = lead_in(l, chain_node(seq[0], edges, True), seq[0][0], edges, inc_l, True)
+            post = lead_in(l, chain_node(seq[-1], edges, False), seq[-1][0], edges, inc_l, False)
+            own = {i for i, _ in seq}
+            pre = pre if pre and pre[0] not in own else None
+            post = post if post and post[0] not in own and (not pre or post[0] != pre[0]) else None
+            c, E = draw_path(([pre] if pre else []) + seq + ([post] if post else []), l, edges, orders)
+            if len(c) < 2:
+                continue
+            sd = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(c, axis=0).T))])
+            mask = np.ones(len(c), bool)
+            if pre:
+                k0 = int(np.argmax(E != pre[0]))
+                mask &= sd >= sd[k0] - RAMP_M
+            if post:
+                k1 = len(E) - 1 - int(np.argmax(E[::-1] != post[0]))
+                mask &= sd <= sd[k1] + RAMP_M
+            c, E = c[mask], E[mask]
             if len(c) < 2:
                 continue
             # extensions (sections a line runs on with under EXT_SHARE of its busiest section's trips) dashed
