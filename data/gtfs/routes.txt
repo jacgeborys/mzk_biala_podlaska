@@ -10,5 +10,5 @@ H,MZK,H,Sidorska – Terebelska,3,9A6324,FFFFFF
 I,MZK,I,Terebelska – Chłodna,3,469990,FFFFFF
 K,MZK,K,Akademicka Pętla,3,800000,FFFFFF
 L,MZK,L,AK – Okopowa – Narutowicza,3,808000,FFFFFF
-M,MZK,M,Grzybowa  –  Terebelska,3,000075,FFFFFF
+M,MZK,M,Grzybowa – Terebelska,3,000075,FFFFFF
 T,MZK,T,Cmentarz Kom. – Cmentarz Kom.,3,A9A9A9,000000

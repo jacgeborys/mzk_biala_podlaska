@@ -10,6 +10,9 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `data/raw/1488.7z`, `data/raw/1488/` | Export as received (do not edit) |
 | `convert_to_gtfs.py` | Raw export -> GTFS |
 | `data/gtfs/`, `data/gtfs.zip` | Generated feed |
+| `export_gis.py` | GTFS -> GeoPackage + network diagram |
+| `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line) |
+| `png/network_diagram.png` | Quick network diagram (line colours, termini labels, trip counts in legend) |
 | `data/qa/shape_legs.csv` | Per stop-to-stop leg: straight-line vs routed distance (shape QA) |
 | `data/cache/` | OSM road graph + Overpass cache (git-ignored, re-downloaded if missing) |
 | `data/validation/` | MobilityData validator report (git-ignored) |
@@ -20,6 +23,7 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 ```bash
 python convert_to_gtfs.py            # rebuild data/gtfs + data/gtfs.zip
 python convert_to_gtfs.py --no-shapes   # skip OSM routing
+python export_gis.py                 # GeoPackage + diagram (after the conversion)
 java -jar tools/gtfs-validator-cli.jar -i data/gtfs.zip -o data/validation -c pl
 ```
 Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the validator.
@@ -44,13 +48,17 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
   trip start. 33 groups of stops sharing a minute are ordered by the shortest path between neighbours.
 - **Times**: arrival = departure = timetable minute, `timepoint=1`.
 - **Shapes**: one per variant (`<line>_<variant>`), map-matched on the OSM `drive_service` network
-  (Viterbi over the 6 nearest edges within 60 m of each stop; service roads cost ×1.5); one-ways respected.
+  (Viterbi over the 6 nearest edges within 60 m of each stop); one-ways respected. Cost = length × road class
+  weight (`ROAD_WEIGHTS`): primary/secondary/trunk 1.0, tertiary 1.05, residential/unclassified 1.1, service 1.5;
+  `living_street` excluded. Mild on purpose: only removes side-street shortcuts (19 of 102 shapes changed, max +124 m).
   `shape_dist_traveled` in metres in shapes and stop_times. All stops lie within ~31 m of their shape.
 - **Routes**: `route_type=3`, long name from the basic variant, colours assigned arbitrarily (`LINE_COLORS`).
 - Trip notes (`UWAGI_KURS`) are not exported; headsigns come from the variant. Seasonal notes do not affect this
   period: "G" (to Grzybowa działki 1.IV–31.X) trips end at Grzybowa 1 in the export, "W" (not 1.XI) is before it.
 
 ## Status (2026-11-16)
+
+- GeoPackage + `png/network_diagram.png` (`export_gis.py`); routing now uses road class weights, living streets excluded.
 
 - Feed built: 13 lines (A–M, T weekends only), 318 posts / 172 stations, 1249 trips, 25 613 stop times, 102 shapes;
   valid 10.11–31.12.2026.

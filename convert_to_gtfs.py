@@ -31,6 +31,18 @@ AGENCY = dict(agency_id="MZK", agency_name="MZK Biała Podlaska",
               agency_lang="pl")
 METRIC_CRS = "EPSG:2180"
 
+# Routing cost = length x class weight: mild preference for main roads, so shapes avoid
+# shortcuts through side streets that buses do not take. Living streets are never used.
+ROAD_WEIGHTS = {
+    "motorway": 1.0, "motorway_link": 1.0, "trunk": 1.0, "trunk_link": 1.0,
+    "primary": 1.0, "primary_link": 1.0, "secondary": 1.0, "secondary_link": 1.0,
+    "tertiary": 1.05, "tertiary_link": 1.05,
+    "unclassified": 1.1, "residential": 1.1,
+    "service": 1.5,
+}
+DEFAULT_ROAD_WEIGHT = 1.1
+EXCLUDED_ROADS = {"living_street"}
+
 # One colour per line, distinct hues (text colour picked for contrast below)
 LINE_COLORS = {
     "A": "E6194B", "B": "3CB44B", "C": "4363D8", "D": "F58231", "E": "911EB4",
@@ -159,9 +171,13 @@ class Router:
                 geom = LineString(list(geom.coords)[::-1])
             geoms.append(geom)
         edges["geometry"] = geoms
-        hw = edges.highway.astype(str)
-        penalty = np.where(hw.str.contains("service"), 1.5, 1.0)
-        edges["w"] = edges.geometry.length * penalty
+        # merged (simplified) edges carry a list of classes: drop if any part is excluded,
+        # otherwise weight by the worst class
+        classes = edges.highway.map(lambda h: h if isinstance(h, list) else [h])
+        edges = edges[~classes.map(lambda c: bool(EXCLUDED_ROADS & set(c)))].reset_index(drop=True)
+        classes = edges.highway.map(lambda h: h if isinstance(h, list) else [h])
+        penalty = classes.map(lambda c: max(ROAD_WEIGHTS.get(x, DEFAULT_ROAD_WEIGHT) for x in c))
+        edges["w"] = edges.geometry.length * penalty.values
         self.edges = edges
         # best parallel edge per (u, v) for path reconstruction
         best = edges.sort_values("w").drop_duplicates(["u", "v"])
@@ -343,7 +359,7 @@ def main():
         base = w[w.PODSTAWOWY == "Y"]
         # basic variant if flagged, else the variant with most trips
         main_var = base.iloc[0] if len(base) else w[w.WARIANT == used.index[0]].iloc[0]
-        long_name = main_var.OPIS_KIER.replace("->", " – ")
+        long_name = clean_name(main_var.OPIS_KIER.replace("->", " – "))
         col = LINE_COLORS.get(line, "777777")
         routes.append(dict(route_id=line, agency_id=AGENCY["agency_id"], route_short_name=line,
                            route_long_name=long_name, route_type=3,
