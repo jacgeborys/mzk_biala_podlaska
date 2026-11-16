@@ -11,12 +11,12 @@ Unofficial GTFS feed built from the city bus timetable export of MZK Biała Podl
 | `convert_to_gtfs.py` | Raw export -> GTFS |
 | `data/gtfs/`, `data/gtfs.zip` | Generated feed |
 | `export_gis.py` | GTFS -> GeoPackage + network diagram |
-| `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line), `segments` (cartogram: trips / lines per street piece, from `cartogram.py`) |
+| `data/gis/biala_podlaska_gtfs.gpkg` | EPSG:2180 layers: `stops` (posts, lines, departures per day type), `stations`, `variants` (one connected LineString per shape, trips per day type), `lines` (variants merged per line), `segments` + `segment_nodes` (simplified bus network from `cartogram.py`: edges with trips / lines / from_node / to_node, nodes with degree and busiest edge; reusable by other diagrams) |
 | `png/network_diagram.png` | Quick preview, only with `python export_gis.py --png` |
 | `animate_buses.py` | Animation of every bus of one day moving along its shape (dots + trails, clock, bus count) |
 | `video/biala_podlaska_buses_<date>.mp4`, `video/frame_<HHMM>.png` | Animation (mp4 git-ignored) and preview stills |
 | `data/basemap/` | OSM basemap layers (gpkg, EPSG:4326; roads, water, buildings, forests, railways, ...), git-ignored; fetched 2026-11-16 from the Geofabrik Lubelskie extract, bbox 51.990-52.083 N, 22.986-23.245 E (no script here regenerates it yet) |
-| `cartogram.py` | Flow cartogram on a simplified node/edge network (2026-11-17 rewrite): shapes folded into one centreline per street (35 m: directions, carriageways, variants), self-overlaps of loop shapes cut back (10 m), passes counted per 10 m bin along each piece (50 m median filter), pieces cut where the count steps, edges between nodes with one value each (length-weighted median), roundabouts / staggered crossings (< 40 m) contracted to one node; no width cap (old per-piece counting gave 325-633 along the Dworzec PKP spur; real: ~430-490 on the spur, 164 D/F/H on the street east of it). TransitFrequency poster layout |
+| `cartogram.py` | Flow cartogram on a simplified node/edge network: shapes folded into one centreline per street (35 m: directions, carriageways, variants; a loop / out-and-back shape keeps one copy of its street), passes counted per 10 m bin along each piece (50 m median filter), pieces cut where the count steps, edges between nodes with one value each (length-weighted median); roundabouts / staggered crossings (< 40 m) and close loose ends contracted to one node, turning loops (< 250 m) dropped. Counts are flow-consistent (at most junctions the other edges add up exactly to the busiest). Drawing: no width cap; where a trunk splits / merges (other edges' trips <= 1.15 x trunk) the branches start side by side inside the trunk (slot by share of trips, leftmost turn on the left, round cap) and ease to their own centreline over 180 m; elsewhere a joint dot. Dworzec PKP: spur 469, last 73 m to the stop 633 (everyone in and out, D/F/H also come from the east street, 164). TransitFrequency poster layout |
 | `png/cartogram_<date>.png`, `png/cartogram_<date>_city.png` | Cartogram, all stops / city limits (dashed); `_city_nocap.png` is from the old version |
 | `data/gis/city_limits.gpkg` | City limits, OSM relation 3016433 (via Nominatim, 49.4 km2) |
 | `png/biala_podlaska_5min_departures_20261118.png` | 5-min walk frequency map, 300 dpi, made by TransitFrequency (see below) |
@@ -122,6 +122,5 @@ Other projects are only changed for a reason and with the user's OK; their outpu
 - Feed files and the GeoPackage are overwritten in place (QGIS keeps them open; deleting fails on Windows).
 - The basemap in `data/basemap/` is a copy of `D:\QGIS\osm_basemapialapodlaska` (made by TransitFrequency).
 
-- Cartogram open issue: one corridor piece at Dworzec PKP still runs down the spur and back up it (a loop shape kept whole), so the lower spur is drawn twice (469 on top of 164); fix = cut self-overlaps inside a single piece too. `png/cartogram_20261118.png` (all-stops frame) not regenerated yet.
 - Next: polish the subway-style map (legend texts, stations), maybe 10-min walk variant; feed expires
   31.12.2026 — a new export will be needed for 2027.

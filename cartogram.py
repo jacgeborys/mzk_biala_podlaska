@@ -50,6 +50,9 @@ SHORT_M = 60          # count steps closer than this are merged (corridor links 
 BIN_M = 10            # passes counted in bins of this length along each corridor piece
 SMOOTH_BINS = 5       # median filter over the bins (50 m)
 SIMPLIFY_M = 6        # drawn edge geometry simplified to this tolerance
+LOOP_M = 250          # edges starting and ending at the same node shorter than this are turning loops (dropped)
+SPLIT_SUM = 1.15      # a node is a split / merge when the other forward edges' trips add up to at most this x the trunk
+TAPER_M = 180         # a stacked branch eases from its slot in the trunk to its own centreline over this length
 MAX_WIDTH_PT = 16
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
 
@@ -107,6 +110,22 @@ def load(date):
 
 
 # ---------------------------------------------------------------- 1-2: corridors and graph
+def self_fold(p, step=5.0):
+    """Line p without the stretches where it runs back along itself (within DUP_M of its own course at least
+    60 m earlier, for more than 3 * DUP_M): an out-and-back or loop shape keeps one copy of the street."""
+    ds = np.arange(0, p.length, step)
+    dup = np.array([s > 60 and substring(p, 0, s - 60).distance(p.interpolate(s)) <= DUP_M for s in ds])
+    if not dup.any():
+        return [p]
+    keep, a = [], 0.0
+    for run in np.split(np.flatnonzero(dup), np.flatnonzero(np.diff(np.flatnonzero(dup)) > 1) + 1):
+        if len(run) * step > 3 * DUP_M:
+            keep.append((a, ds[run[0]]))
+            a = min(ds[run[-1]] + step, p.length)
+    keep.append((a, p.length))
+    return [substring(p, x, y) for x, y in keep if y - x > 0.5]
+
+
 def corridors(geoms, n_shape):
     """One centreline per street: shapes added busiest first, each keeping only what lies farther than TOL from
     the corridors so far; every cut end linked to the corridor its route continues on (40 m past the cut)."""
@@ -114,7 +133,7 @@ def corridors(geoms, n_shape):
     for s in sorted(geoms, key=lambda s: -n_shape[s]):
         g = geoms[s]
         rest = g.difference(unary_union(kept).buffer(TOL)) if kept else g
-        for p in parts(rest):
+        for p in [q for r in parts(rest) for q in self_fold(r)]:
             if p.length >= MIN_PART:
                 kept.append(p)
                 src.append(g)
@@ -267,7 +286,8 @@ def edge_value(e):
 
 
 def contract_short(edges):
-    """Nodes joined by edges shorter than CONTRACT_M become one node at their centre (dead ends are kept)."""
+    """Nodes joined by edges shorter than CONTRACT_M, and dead ends closer than that to each other, become one node
+    at their centre (short dead-end edges are kept)."""
     deg = defaultdict(int)
     for e in edges:
         deg[e["u"]] += 1
@@ -275,6 +295,11 @@ def contract_short(edges):
     G = nx.Graph()
     G.add_edges_from((e["u"], e["v"]) for e in edges
                      if e["geom"].length < CONTRACT_M and e["u"] != e["v"] and deg[e["u"]] > 1 and deg[e["v"]] > 1)
+    ends = [n for n, k in deg.items() if k == 1]               # two loose ends this close: a corridor cut not relinked
+    for x in range(len(ends)):
+        for y in range(x + 1, len(ends)):
+            if np.hypot(ends[x][0] - ends[y][0], ends[x][1] - ends[y][1]) < CONTRACT_M:
+                G.add_edge(ends[x], ends[y])
     rep = {}
     for comp in nx.connected_components(G):
         c = tuple(np.round(np.array(list(comp)).mean(axis=0), 1))
@@ -296,15 +321,90 @@ def network(date):
     pieces = corridors(geoms, n_shape)
     items = split_by_profile(pieces, *piece_profiles(pieces, geoms, n_shape, line_of))
     edges = [e for e in chain(items) if e["trips"] > 0]   # junction to junction, route end or real step
-    edges = chain(contract_short(edges))       # roundabouts to one node, then neighbours joined again
+    edges = [e for e in contract_short(edges)          # roundabouts to one node; turning loops (their buses are
+             if not (e["u"] == e["v"] and e["geom"].length < LOOP_M)]   # counted on the way in and out) dropped
+    edges = chain(edges)                       # neighbours joined again
     print(f"network: {len(pieces)} corridor pieces, {len(items)} after cuts at steps -> {len(edges)} edges, "
           f"{len({n for e in edges for n in (e['u'], e['v'])})} nodes")
     return edges, n_trips
 
 
-def segments_gdf(edges):
-    return gpd.GeoDataFrame([dict(trips=e["trips"], lines=",".join(sorted(e["lines"])), n_lines=len(e["lines"]),
-                                  geometry=e["geom"]) for e in edges], crs=CRS)
+def network_gdfs(edges):
+    """The simplified network for reuse: edges (trips, lines, from_node, to_node) and nodes (node_id, degree,
+    trips = busiest edge there)."""
+    nodes = sorted({n for e in edges for n in (e["u"], e["v"])})
+    nid = {n: k for k, n in enumerate(nodes)}
+    deg, top = defaultdict(int), defaultdict(int)
+    for e in edges:
+        for n in (e["u"], e["v"]):
+            deg[n] += 1
+            top[n] = max(top[n], e["trips"])
+    seg = gpd.GeoDataFrame([dict(trips=e["trips"], lines=",".join(sorted(e["lines"])), n_lines=len(e["lines"]),
+                                 from_node=nid[e["u"]], to_node=nid[e["v"]], length_m=round(e["geom"].length, 1),
+                                 geometry=e["geom"]) for e in edges], crs=CRS)
+    nod = gpd.GeoDataFrame([dict(node_id=nid[n], degree=deg[n], trips=top[n], geometry=Point(n)) for n in nodes],
+                           crs=CRS)
+    return seg, nod
+
+
+def branch_offsets(edges, m_per_pt, vmax):
+    """Per edge the lateral offset (m, left of its own direction) at its start and end. At a node where a trunk
+    (busiest edge) divides into edges whose trips add up to at most SPLIT_SUM of it, those edges are stacked side by
+    side across the trunk in the order they turn (leftmost on the left, slot by share of trips, kept inside the
+    trunk), so branches peel off its sides; at a plain
+    crossing or a simple width step everything stays centred. Also returns the stacked nodes and edge ends."""
+    W = {i: width_of(e["trips"], vmax) * m_per_pt for i, e in enumerate(edges)}
+    inc = defaultdict(list)
+    for i, e in enumerate(edges):
+        c = list(e["geom"].coords)
+        for at_u, n in ((True, e["u"]), (False, e["v"])):
+            g = e["geom"]
+            q = g.interpolate(min(30.0, g.length / 2) if at_u else max(0.0, g.length - min(30.0, g.length / 2)))
+            o = c[0] if at_u else c[-1]
+            inc[n].append((i, at_u, np.arctan2(q.y - o[1], q.x - o[0])))
+    off = defaultdict(lambda: [0.0, 0.0])
+    stacked, slots = set(), set()
+    for n, es in inc.items():
+        if len(es) < 3:
+            continue
+        t, _, ht = max(es, key=lambda x: W[x[0]])
+        h_in = ht + np.pi
+        cand = []
+        for i, at_u, h in es:
+            if i == t:
+                continue
+            rel = (h - h_in + np.pi) % (2 * np.pi) - np.pi
+            if abs(rel) < np.radians(110):
+                cand.append((rel, i, at_u))
+        T = sum(edges[i]["trips"] for _, i, _ in cand)
+        if len(cand) < 2 or T > SPLIT_SUM * edges[t]["trips"]:
+            continue
+        stacked.add(n)
+        cum = 0.0
+        for rel, i, at_u in sorted(cand, reverse=True):          # leftmost turn first
+            share = edges[i]["trips"] / T
+            room = max(0.0, (W[t] - W[i]) / 2)                     # the branch stays inside the trunk
+            lat = float(np.clip(W[t] * (0.5 - cum - share / 2), -room, room)) * np.cos(rel)
+            cum += share
+            off[i][0 if at_u else 1] = lat if at_u else -lat       # left of the direction into the node
+            slots.add((i, 0 if at_u else 1))
+    return off, stacked, slots
+
+
+def offset_line(g, o_start, o_end, step=4.0):
+    """g shifted sideways by o_start at its start and o_end at its end, each easing to 0 over TAPER_M (cosine)."""
+    if abs(o_start) < 0.01 and abs(o_end) < 0.01:
+        return list(g.coords)
+    L = g.length
+    d = np.append(np.arange(0, L, step), L)
+    xy = np.array([g.interpolate(t).coords[0] for t in d])
+    tx, ty = np.gradient(xy[:, 0]), np.gradient(xy[:, 1])
+    nrm = np.hypot(tx, ty)
+    nrm[nrm == 0] = 1
+    T = min(TAPER_M, L / 2)
+    f = lambda s: np.where(s < T, 0.5 * (1 + np.cos(np.pi * np.clip(s / T, 0, 1))), 0.0)  # noqa: E731
+    o = o_start * f(d) + o_end * f(L - d)
+    return list(zip(xy[:, 0] - ty / nrm * o, xy[:, 1] + tx / nrm * o))
 
 
 def width_of(v, vmax):
@@ -347,20 +447,28 @@ def draw(edges, n_trips, date, frame, out, limits=None):
     if limits is not None:
         limits.boundary.plot(ax=ax, color="#8a8a96", linewidth=1.0, linestyle=(0, (4, 3)), zorder=2, aspect=None)
 
-    # one line per edge, flat ends; each node gets a dot as wide as the second-widest edge there, which closes
-    # the bend of a line passing through without sticking out where a thick edge simply continues as a thin one
+    # one line per edge, flat ends; where a trunk divides, its branches start side by side inside it (branch_offsets).
+    # Each node gets a dot as wide as the second-widest edge there, which closes the bend of a line passing through
+    # without sticking out where a thick edge simply continues as a thin one
     edges = sorted(edges, key=lambda e: e["trips"])  # busiest drawn last, on top
     vals = np.array([e["trips"] for e in edges])
     vmax = top = int(vals.max())
+    off, stacked, slots = branch_offsets(edges, w / (map_w * 72), vmax)
     at = defaultdict(list)
     for e in edges:
         at[e["u"]].append(e["trips"])
         at[e["v"]].append(e["trips"])
-    jx = np.array([n for n, vs in at.items() if len(vs) > 1])
-    jv = np.array([sorted(vs)[-2] for vs in at.values() if len(vs) > 1])
+    jx = np.array([n for n, vs in at.items() if len(vs) > 1 and n not in stacked])
+    jv = np.array([sorted(vs)[-2] for n, vs in at.items() if len(vs) > 1 and n not in stacked])
     ax.scatter(jx[:, 0], jx[:, 1], s=width_of(jv, vmax) ** 2, c=[color_of(v, vmax) for v in jv],
                linewidths=0, zorder=3)
-    ax.add_collection(LineCollection([list(e["geom"].simplify(SIMPLIFY_M).coords) for e in edges],
+    lines = [offset_line(e["geom"].simplify(SIMPLIFY_M), *off[i]) for i, e in enumerate(edges)]
+    # a stacked branch gets a round cap at its slot in the trunk: closes the corner where it bends away
+    caps = [(lines[i][0 if end == 0 else -1], edges[i]["trips"]) for i, end in slots]
+    if caps:
+        ax.scatter([c[0][0] for c in caps], [c[0][1] for c in caps], s=width_of(np.array([c[1] for c in caps]), vmax) ** 2,
+                   c=[color_of(c[1], vmax) for c in caps], linewidths=0, zorder=3)
+    ax.add_collection(LineCollection(lines,
                                      linewidths=width_of(vals, vmax), colors=[color_of(v, vmax) for v in vals],
                                      capstyle="butt", joinstyle="round", zorder=3.1))
 
@@ -433,8 +541,9 @@ def main():
     args = ap.parse_args()
 
     edges, n_trips = network(args.date)
-    seg = segments_gdf(edges)
+    seg, nod = network_gdfs(edges)
     seg.to_file(GPKG, layer="segments", driver="GPKG")
+    nod.to_file(GPKG, layer="segment_nodes", driver="GPKG")
     print(f"segments: {len(seg)} edges, busiest {seg.trips.max()} buses/day "
           f"({seg.sort_values('trips').iloc[-1].lines}) -> {GPKG.name}:segments")
     out = Path(args.out) if args.out else ROOT / "png" / f"cartogram_{args.date}{'_city' if args.city else ''}.png"
