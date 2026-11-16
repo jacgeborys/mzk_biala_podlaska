@@ -10,7 +10,8 @@ Built for a small town (10 km across) straight from the feed in data/gtfs/, no t
   5. each line is drawn as continuous chains along its lane (offset curves, joined at junctions, corners
      rounded over a few metres); stops are black dots on the lines that call there; interchanges, termini and
      Dworzec PKP get a white capsule across the bundle and a name
-Colours / legend names: config/diagram_lines.json. Output: png/bus_network_city.png (zoomed to the city limits).
+Colours / legend names: config/diagram_lines.json. Output: png/bus_network_city.png + .pdf (vector, for print),
+zoomed to the city limits.
 
 Usage:  python diagram.py [--date 20261118] [--out png/bus_network_city.png] [--seed 1]
 """
@@ -50,6 +51,11 @@ ROUND_M = 12        # corner rounding (densify step for Chaikin smoothing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
 MAIN_TERMINUS = 0.5               # a station is a line's terminus when this share of its trips start or end there
+CONNECT_M = 500     # a line broken into pieces is joined along the corridors if the gap is at most this long
+DROP_M = 150        # pieces of a line shorter than this that cannot be joined are dropped (strays)
+END_JOIN_M = 400    # a loose end of a line inside the network continues this far at most to reach the line again
+PAIR_M = 80         # two loose ends of one line this close are bridged
+STUB_M = 150        # dead-end bits of a line this short that do not end where its routes end are dropped
 FONT = Path("C:/Windows/Fonts/bahnschrift.ttf")
 LAND, WATER, GREEN, INK = "#f5f2ea", "#a9cde6", "#d9e8cf", "#1d1d1f"
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
@@ -116,49 +122,60 @@ def load(date):
 # ---------------------------------------------------------------- 1-3: corridors, pieces, edges
 def corridors(geoms, n_shape, line_of, line_trips):
     order = sorted(geoms, key=lambda s: (-line_trips[line_of[s]], line_of[s], -n_shape[s]))
-    kept = []
+    kept, src = [], []
     for s in order:
         g = geoms[s]
         rest = g.difference(unary_union(kept).buffer(TOL)) if kept else g
-        kept += [p for p in parts(rest) if p.length >= MIN_PART]
-    # join cut-off ends back to the corridor they were cut from
+        for p in parts(rest):
+            if p.length >= MIN_PART:
+                kept.append(p)
+                src.append(g)
+    # join every cut end back to the corridor its route continues on: follow the original route 40 m past the
+    # cut (into the folded stretch) and link to the kept corridor nearest that point
     links = []
     tree = STRtree(kept)
-    for i, p in enumerate(kept):
-        for end in (Point(p.coords[0]), Point(p.coords[-1])):
-            cand = [j for j in tree.query(end.buffer(TOL + 15)) if j != i]
+    for i, (p, g) in enumerate(zip(kept, src)):
+        for at_start, end in ((True, Point(p.coords[0])), (False, Point(p.coords[-1]))):
+            d = g.project(end)
+            if d < 1 or d > g.length - 1:            # a real route end, not a cut
+                continue
+            ahead = g.interpolate(d - 40 if at_start else d + 40)
+            cand = [j for j in tree.query(ahead.buffer(TOL + 30)) if j != i]
             if not cand:
                 continue
-            j = min(cand, key=lambda j: kept[j].distance(end))
-            d = kept[j].distance(end)
-            if 0.5 < d <= TOL + 15:
-                q = kept[j].interpolate(kept[j].project(end))
+            j = min(cand, key=lambda j: kept[j].distance(ahead))
+            if kept[j].distance(ahead) > TOL + 30:
+                continue
+            q = kept[j].interpolate(kept[j].project(ahead))
+            if end.distance(q) > 0.5:
                 links.append(LineString([end, q]))
     return parts(unary_union(kept + links))
 
 
-def lines_on(pieces, geoms, line_of):
-    by_line = defaultdict(list)
-    for s, g in geoms.items():
-        by_line[line_of[s]].append(g)
-    trees = {l: (STRtree(gs), gs) for l, gs in by_line.items()}
+def lines_on(pieces, geoms, line_of, step=10.0):
+    """Lines per corridor piece. Every shape is sampled each `step` m and each sample votes only for the NEAREST
+    parallel piece within TOL + 8 m, so a route lands on one corridor and never on a parallel street next to it.
+    A piece carries a line when the line's votes cover at least half of it (short pieces: one vote)."""
+    tree = STRtree(pieces)
+    votes = defaultdict(lambda: defaultdict(float))
+    for sid, g in geoms.items():
+        l = line_of[sid]
+        seen = defaultdict(float)
+        for d in np.arange(0, g.length, step):
+            pt = g.interpolate(d)
+            h = heading_at(g, d)
+            cand = [i for i in tree.query(pt.buffer(TOL + 8))
+                    if pieces[i].distance(pt) <= TOL + 8
+                    and ang_diff(heading_at(pieces[i], pieces[i].project(pt)), h) <= PARALLEL_DEG]
+            if cand:
+                i = min(cand, key=lambda i: pieces[i].distance(pt))
+                seen[i] += step
+        for i, v in seen.items():                       # a line counts once per piece (max over its shapes)
+            votes[i][l] = max(votes[i][l], v)
     out = []
-    for p in pieces:
-        fr = [0.5] if p.length < 40 else [0.2, 0.5, 0.8]
-        here = set()
-        for l, (tree, gs) in trees.items():
-            hits = 0
-            for f in fr:
-                pt = p.interpolate(f, normalized=True)
-                h = heading_at(p, f * p.length)
-                for k in tree.query(pt.buffer(TOL + 8)):
-                    g = gs[k]
-                    if g.distance(pt) <= TOL + 8 and ang_diff(heading_at(g, g.project(pt)), h) <= PARALLEL_DEG:
-                        hits += 1
-                        break
-            if hits >= math.ceil(0.6 * len(fr)):
-                here.add(l)
-        out.append(here)
+    for i, p in enumerate(pieces):
+        need = min(0.5 * p.length, step)
+        out.append({l for l, v in votes[i].items() if v >= max(need, 0.5 * p.length if p.length > 2 * step else step)})
     return out
 
 
@@ -186,6 +203,106 @@ def build_edges(pieces, sets):
                 changed = True
                 break
     return list(edges.values())
+
+
+# ---------------------------------------------------------------- 3b: continuous lines
+def repair_lines(edges, geoms, line_of):
+    """Every line drawn as one connected network ending where its routes end: pieces of a line separated by a
+    corridor the membership test missed are joined (shortest corridor path, CONNECT_M), short unjoinable strays
+    and dead-end stubs that are not route ends are dropped."""
+    import networkx as nx
+    G = nx.Graph()
+    for i, e in enumerate(edges):
+        if not G.has_edge(e["u"], e["v"]) or G[e["u"]][e["v"]]["w"] > e["geom"].length:
+            G.add_edge(e["u"], e["v"], i=i, w=e["geom"].length)
+    route_ends = defaultdict(list)
+    for sid, g in geoms.items():
+        route_ends[line_of[sid]] += [Point(g.coords[0]), Point(g.coords[-1])]
+    edges = list(edges)
+    lines = [set(e["lines"]) for e in edges]
+    joined, dropped = 0, 0
+
+    def sub(l):
+        H = nx.Graph()
+        for i, ls in enumerate(lines):
+            if l in ls:
+                H.add_edge(edges[i]["u"], edges[i]["v"], i=i)
+        return H
+
+    def comp_len(H, c):
+        return sum(edges[H[a][b]["i"]]["geom"].length for a, b in H.subgraph(c).edges)
+
+    for l in sorted(route_ends):
+        for _ in range(50):
+            H = sub(l)
+            comps = sorted(nx.connected_components(H), key=lambda c: comp_len(H, c))
+            if len(comps) <= 1:
+                break
+            c, others = comps[0], set().union(*comps[1:])
+            dist, path = nx.multi_source_dijkstra(G, c, weight="w", cutoff=CONNECT_M)
+            targets = [n for n in others if n in dist]
+            if targets:
+                p = path[min(targets, key=dist.get)]
+                for a, b in zip(p, p[1:]):
+                    lines[G[a][b]["i"]].add(l)
+                joined += 1
+            elif comp_len(H, c) < DROP_M:
+                for a, b in H.subgraph(c).edges:
+                    lines[H[a][b]["i"]].discard(l)
+                dropped += 1
+            else:
+                break
+        # loose ends inside the network (the line goes on along a corridor piece that starts a few metres away,
+        # where carriageways / one-way pairs were folded): continue to the nearest other part of the line
+        H = sub(l)
+        for n in [n for n in H.nodes if H.degree(n) == 1]:
+            if any(Point(n).distance(q) <= TOL + 40 for q in route_ends[l]):
+                continue
+            (m,) = list(H.neighbors(n))
+            own = H[n][m]["i"]
+            G2 = G.copy()
+            if G2.has_edge(n, m) and G2[n][m]["i"] == own:
+                G2.remove_edge(n, m)
+            dist, path = nx.single_source_dijkstra(G2, n, weight="w", cutoff=END_JOIN_M)
+            targets = [t for t in H.nodes if t not in (n, m) and t in dist]
+            if targets:
+                p = path[min(targets, key=dist.get)]
+                for a, b in zip(p, p[1:]):
+                    lines[G2[a][b]["i"]].add(l)
+                joined += 1
+        # two loose ends of the line close together (it arrives on one corridor strand and leaves on another that
+        # does not touch it): bridge them
+        H = sub(l)
+        loose = [n for n in H.nodes if H.degree(n) == 1
+                 and not any(Point(n).distance(q) <= TOL + 40 for q in route_ends[l])]
+        done = set()
+        for x in loose:
+            if x in done:
+                continue
+            near = [y for y in loose if y != x and y not in done and Point(x).distance(Point(y)) <= PAIR_M]
+            if near:
+                y = min(near, key=lambda y: Point(x).distance(Point(y)))
+                edges.append(dict(geom=LineString([x, y]), lines=frozenset(), u=x, v=y))
+                lines.append({l})
+                done |= {x, y}
+                joined += 1
+        changed = True
+        while changed:
+            changed = False
+            H = sub(l)
+            for n in [n for n in H.nodes if H.degree(n) == 1]:
+                if any(Point(n).distance(q) <= TOL + 40 for q in route_ends[l]):
+                    continue
+                (m,) = list(H.neighbors(n))
+                i = H[n][m]["i"]
+                if edges[i]["geom"].length < STUB_M:
+                    lines[i].discard(l)
+                    dropped += 1
+                    changed = True
+                    break
+    out = [dict(e, lines=frozenset(ls)) for e, ls in zip(edges, lines) if ls]
+    print(f"line repair: {joined} gaps joined, {dropped} strays / stubs dropped")
+    return out
 
 
 # ---------------------------------------------------------------- 4: line order
@@ -360,7 +477,7 @@ def station_spots(stations, edges, rank):
 
 
 # ---------------------------------------------------------------- render
-def render(edges, order, stations, line_cfg, date, out, n_cross):
+def render(edges, order, stations, line_cfg, date, out):
     rank = {l: k for k, l in enumerate(order)}
     limits = gpd.read_file(LIMITS).to_crs(CRS)
     x0, y0, x1, y1 = limits.total_bounds
@@ -393,66 +510,100 @@ def render(edges, order, stations, line_cfg, date, out, n_cross):
     limits.boundary.plot(ax=ax, color="#9a9a9a", linewidth=1.0, linestyle=(0, (5, 4)), zorder=1.5, aspect=None)
 
     colors = {l: c for l, c in zip([g[0] for g in line_cfg["groups"]], line_cfg["colors"])}
+    drawn = []                                    # drawn lines / capsules (map metres), kept clear of labels
     for l in reversed(order):
         for c in line_chains(l, edges, rank):
             c = np.asarray(c)
             ax.plot(c[:, 0], c[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
                     solid_joinstyle="round", zorder=3)
+            drawn.append(LineString(c))
 
-    # stops, interchanges, labels (one name per stop name without the post number, greedy placement)
+    # where each line ends: a terminus bar across its lane, and the stop there gets a name
+    inc = defaultdict(list)
+    for i, e in enumerate(edges):
+        for l in e["lines"]:
+            inc[(l, e["u"])].append(i)
+            inc[(l, e["v"])].append(i)
+    line_ends = [(l, np.array(n), es[0]) for (l, n), es in inc.items() if len(es) == 1]
+
+    # stops, interchanges, labels (one name per stop name without the post number)
     spots = station_spots(stations, edges, rank)
-    halo = [patheffects.withStroke(linewidth=3.2, foreground=LAND)]
+    halo = [patheffects.withStroke(linewidth=4, foreground=LAND)]
     m_per_pt = 1 / pt_per_m
-    placed = []                                   # label boxes in map metres
-
-    def free(b):
-        return all(b[2] < q[0] or b[0] > q[2] or b[3] < q[1] or b[1] > q[3] for q in placed)
     base_name = lambda n: re.sub(r"\s+\d+[A-Za-z]?(\s*\(.*\))?$", "", n).strip()  # noqa: E731
-    labelled = set()
-    order_st = sorted(spots, key=lambda k: (stations[k]["name"] not in KEY_STATIONS, -len(stations[k]["lines"])))
-    for sid in order_st:
-        i, base, t, ls = spots[sid]
+
+    def capsule(p, q):
+        ax.plot([p[0], q[0]], [p[1], q[1]], color=INK, lw=lw * 1.3, solid_capstyle="round", zorder=5)
+        ax.plot([p[0], q[0]], [p[1], q[1]], color="white", lw=lw * 0.85, solid_capstyle="round", zorder=5.1)
+        drawn.append(LineString([p, q]))
+
+    # stations at line ends (within 200 m of the end, served by that line) count as termini of that line
+    ends_at = defaultdict(set)
+    for l, xy, i in line_ends:
+        cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 200]
+        if cand:
+            ends_at[min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))].add(l)
+        g = edges[i]["geom"]
+        at_start = np.hypot(*(np.array(g.coords[0]) - xy)) < 1
+        h = heading_at(g, 0 if at_start else g.length)
+        nrm = np.array([-math.sin(h), math.cos(h)])
+        p = xy + nrm * lane_offset(edges[i], l, rank)
+        capsule(p - nrm * SPACING * 0.5, p + nrm * SPACING * 0.5)
+
+    requests = []                                 # labels to place
+    for sid, (i, base, t, ls) in spots.items():
         s = stations[sid]
         nrm = np.array([-t[1], t[0]])
-        big = s["name"] in KEY_STATIONS or len(s["lines"]) >= MIN_INTERCHANGE or s["term"]
+        term = s["term"] | ends_at.get(sid, set())
+        big = s["name"] in KEY_STATIONS or len(s["lines"]) >= MIN_INTERCHANGE or term
         if not big:
             for o in [lane_offset(edges[i], l, rank) for l in ls]:
                 p = base + nrm * o
-                ax.scatter([p[0]], [p[1]], s=(lw * 0.6) ** 2, color=INK, zorder=4, linewidths=0)
+                ax.scatter([p[0]], [p[1]], s=(lw * 0.7) ** 2, color=INK, zorder=4, linewidths=0)
             continue
         all_offs = [lane_offset(edges[i], l, rank) for l in edges[i]["lines"]]
         lo, hi = min(all_offs) - SPACING * 0.55, max(all_offs) + SPACING * 0.55
-        a, b = base + nrm * lo, base + nrm * hi
-        ax.plot([a[0], b[0]], [a[1], b[1]], color=INK, lw=lw * 1.3, solid_capstyle="round", zorder=5)
-        ax.plot([a[0], b[0]], [a[1], b[1]], color="white", lw=lw * 0.85, solid_capstyle="round", zorder=5.1)
-        name = base_name(s["name"])
+        capsule(base + nrm * lo, base + nrm * hi)
+        prio = 0 if s["name"] in KEY_STATIONS else 1 if len(s["lines"]) >= MIN_INTERCHANGE else 2
+        requests.append((prio, -len(s["lines"]), sid, base, max(abs(lo), abs(hi)), sorted(term, key=rank.get)))
+
+    # label placement: 16 candidates round the stop, scored by overlap with lines, capsules and placed labels
+    occ = [g.buffer(lw * m_per_pt / 2 + 4) for g in drawn]
+    occ_tree = STRtree(occ)
+    placed = []
+    labelled = set()
+    for prio, _, sid, base, half, bullets in sorted(requests, key=lambda r: (r[0], r[1])):
+        name = base_name(stations[sid]["name"])
         if name in labelled:
             continue
         labelled.add(name)
-        size = 13 if (s["name"] in KEY_STATIONS or len(s["lines"]) >= MIN_INTERCHANGE) else 11
-        w_m = len(name) * size * 0.55 * m_per_pt
-        h_m = size * 1.3 * m_per_pt
-        bullets = sorted(s["term"], key=rank.get)
+        size = 14 if prio == 0 else 13 if prio == 1 else 11.5
+        w_m = len(name) * size * 0.52 * m_per_pt
+        h_m = size * 1.25 * m_per_pt
         if bullets:
             w_m = max(w_m, len(bullets) * 15 * m_per_pt)
-            h_m += 16 * m_per_pt
-        gap = max(abs(lo), abs(hi)) + SPACING * 1.4
-        for ang in (0, 180, 90, 270, 45, 135, 225, 315):
-            v = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
-            anchor = base + v * gap
-            ha = "left" if v[0] > 0.3 else "right" if v[0] < -0.3 else "center"
-            bx0 = anchor[0] if ha == "left" else anchor[0] - w_m if ha == "right" else anchor[0] - w_m / 2
-            by_top = anchor[1] + (h_m if v[1] > 0.3 else h_m / 2 if abs(v[1]) <= 0.3 else 0)
-            bbox = (bx0, by_top - h_m, bx0 + w_m, by_top)
-            if free(bbox):
-                break
-        placed.append(bbox)
-        ty = by_top - size * 0.65 * m_per_pt
-        ax.text(bbox[0] if True else 0, ty, name, fontproperties=font(size), color=INK, ha="left", va="center",
+            h_m += 17 * m_per_pt
+        best = None
+        for dist in (half + SPACING * 1.3, half + SPACING * 3.0):
+            for ang in range(0, 360, 45):
+                v = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
+                anchor = base + v * dist
+                bx0 = anchor[0] if v[0] > 0.3 else anchor[0] - w_m if v[0] < -0.3 else anchor[0] - w_m / 2
+                top = anchor[1] + (h_m if v[1] > 0.3 else h_m / 2 if abs(v[1]) <= 0.3 else 0)
+                bb = box(bx0, top - h_m, bx0 + w_m, top)
+                hit = sum(occ[k].intersection(bb).area for k in occ_tree.query(bb))
+                hit += sum(q.intersection(bb).area for q in placed) * 10
+                score = hit + dist * 0.01
+                if best is None or score < best[0]:
+                    best = (score, bb, top)
+        _, bb, top = best
+        placed.append(bb)
+        ty = top - size * 0.62 * m_per_pt
+        ax.text(bb.bounds[0], ty, name, fontproperties=font(size), color=INK, ha="left", va="center",
                 path_effects=halo, zorder=7)
         for k, l in enumerate(bullets):     # lines ending here: bullets under the name
-            bx = bbox[0] + (k * 15 + 7) * m_per_pt
-            by = ty - (size * 0.65 + 9) * m_per_pt
+            bx = bb.bounds[0] + (k * 15 + 7) * m_per_pt
+            by = ty - (size * 0.62 + 9) * m_per_pt
             ax.scatter([bx], [by], s=13 ** 2, color=colors.get(l, "#888"), zorder=7, linewidths=0)
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
 
@@ -477,12 +628,14 @@ def render(edges, order, stations, line_cfg, date, out, n_cross):
         ax.text(px0 + pw * 0.13, y, names.get(l, l).split("  ", 1)[-1], fontproperties=font(15), color=INK,
                 va="center", zorder=9)
     ax.text(x0 + (x1 - x0) * 0.01, y0 + (y1 - y0) * 0.012,
-            "Dane: rozkład MZK Biała Podlaska (GTFS nieoficjalny) · mapa © OpenStreetMap contributors · "
-            f"przebiegi i kolejność linii wyliczone z rozkładu ({n_cross} przecięć)", fontproperties=font(10),
+            "Schemat poglądowy · przebiegi linii wg rozkładu jazdy MZK Biała Podlaska na środę 18.11.2026 · "
+            "podkład © OpenStreetMap contributors · opracowanie: Jacek Gęborys, 2026", fontproperties=font(10),
             color="#555", zorder=9)
     fig.savefig(out, dpi=150, facecolor=LAND)
+    pdf = Path(out).with_suffix(".pdf")             # vector copy for print
+    fig.savefig(pdf, facecolor=LAND)
     plt.close(fig)
-    print(f"written {out}")
+    print(f"written {out} and {pdf}")
 
 
 def main():
@@ -494,11 +647,11 @@ def main():
     geoms, n_shape, line_of, stations, line_trips = load(args.date)
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
-    edges = build_edges(pieces, sets)
+    edges = repair_lines(build_edges(pieces, sets), geoms, line_of)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     order, n_cross = best_order(sorted(line_trips.index), edges, args.seed)
     print(f"line order {''.join(order)}, crossings {n_cross}")
-    render(edges, order, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out, n_cross)
+    render(edges, order, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
 
 
 if __name__ == "__main__":
