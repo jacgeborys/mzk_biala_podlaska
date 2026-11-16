@@ -1,0 +1,2 @@
+agency_id,agency_name,agency_url,agency_timezone,agency_lang
+MZK,MZK Biała Podlaska,https://mzkbp.pl/,Europe/Warsaw,pl

@@ -1,0 +1,103 @@
+LINIA;WARIANT;KIERUNEK;PODSTAWOWY;GOOGLE_DRUK;OPIS_KIER;OPIS_PRZYST;OPIS_TABL;OPIS_GADACZ
+A;a;T;N;Y;Sidorska->S³awacinek;Sidorska pêtla->S³awacinek;S³awacinek;S³awacinek
+A;c;T;Y;Y;Sidorska->Styrzyniec p.Por.;Sidorska->Styrzyniec p.Por.;Styrzyniec przez Porosiuki;Styrzyniec przez Porosiuki
+A;d;T;N;N;Sidorska->Styrzyniec;Sidorska->Styrzyniec;Styrzyniec;Styrzyniec
+A;e;T;N;N;Sidorska->Warszawska;Sidorska->Warszawska;Warszawska;Warszawska
+A;f;P;N;Y;Styrzyniec->Pod³¹ka->Sidorska;Styrzyniec->Pod³¹ka->Sidorska;Sidorska;Sidorska
+A;g;P;N;Y;Styrzyniec->Sidorska;Styrzyniec->Sidorska;Sidorska;Sidorska
+A;i;P;N;N;S³awacinek->Sidorska;S³awacinek->Sidorska pêtla;Sidorska pêtla;Sidorska pêtla
+A;j;P;N;N;Warszawska->Sidorska;Warszawska->Sidorska;Sidorska pêtla;Sidorska pêtla
+A;k;P;Y;Y;Styrzyniec p.Por.->Sidorska;Styrzyniec p.Por.->Sidorska;Sidorska Pêtla;Sidorska Pêtla
+A;l;T;N;N;Brzegowa->Warszawska;Brzegowa->Warszawska;Warszawska;Warszawska
+A;m;T;N;Y;Sidorska->S³awacinek->Porosiuki;Porosiuki;Porosiuki;
+A;n;P;N;Y;Porosiuki->S³awacinek->Sidorska;Sidorska Pêtla;Sidorska Pêtla;Sidorska Pêtla
+A;o;P;N;Y;Dworzec PKP->Brzegowa;Dworzec PKP->Brzegowa;Brzegowa;Brzegowa
+A;p;T;N;Y;Dworzec PKP;Dworzec PKP;Dworzec PKP;Dworzec PKP
+B;a;T;N;Y;Grzybowa->Francuska Pêtla;Grzybowa->Francuska Pêtla;Francuska Pêtla;Francuska Pêtla
+B;b;P;N;N;Francuska Pêtla->Grzybowa;Francuska Pêtla->Grzybowa;Grzybowa;Grzybowa
+B;c;T;Y;Y;Grzybowa->Grabanów ODR;Grzybowa->Grabanów ODR;Grabanów ODR;Grabanów ODR
+B;d;P;Y;Y;Grabanów ODR->Grzybowa;Grabanów ODR->Grzybowa;Grzybowa;Grzybowa
+B;e;T;Y;Y;Grzybowa->Julk->Grabanów;Grzybowa->Julk->Grabanów;Grabanów ODR p. Julków;Grabanów ODR p. Julków
+B;f;P;Y;Y;Grabanów->Julk->Grzybowa;Grabanów->Julk->Grzybowa;Grzybowa;Grzybowa
+B;h;P;N;N;Dworzec PKP->Grzybowa;Dworzec PKP->Grzybowa;Grzybowa;Grzybowa
+B;i;T;N;N;Grzybowa->Kozula;Grzybowa->Kozula;Kozula;Kozula
+B;j;P;N;N;Kozula->Grzybowa;Kozula->Grzybowa;Grzybowa;Grzybowa
+B;k;T;N;N;Francuska Pêtla->Dworzec PKP;Francuska Pêtla->Dworzec PKP;Dworzec PKP;Dworzec PKP
+B;m;T;N;N;Grzybowa->Dworzec PKP;Grzybowa->Dworzec PKP;Dworzec PKP;Dworzec PKP
+B;q;T;N;N;Grzybowa->Francuska Pêtla;Grzybowa->Francuska Pêtla;Francuska Pêtla;Francuska Pêtla
+B;r;P;N;N;Francuska->Grzybowa Pêtla;Francuska->Grzybowa Pêtla;Grzybowa Pêtla;Grzybowa Pêtla
+B;t;P;N;N;Grabanów->Grzybowa Pêtla;Grabanów->Grzybowa Pêtla;Grzybowa Pêtla p. Julków;Grzybowa Pêtla p. Julków
+B;u;T;N;N;Grzybowa->Kozula;Grzybowa->Kozula;Kozula;Kozula
+B;v;P;N;N;Kozula->Grzybowa Pêtla;Kozula->Grzybowa Pêtla;Grzybowa Pêtla;Grzybowa Pêtla
+B;w;T;N;N;Grzybowa->Julk->Grabanów;Grzybowa->Julk->Grabanów;Grabanów ODR p. Julków;Grabanów ODR p. Julków
+C;$;T;N;N;Robotnicza->Dworzec PKP;Robotnicza->Dworzec PKP;Dworzec PKP;Dworzec PKP
+C;a;T;Y;Y;Robotnicza->Terebelska;Robotnicza->Terebelska;Terebelska pêtla;Terebelska pêtla
+C;b;T;N;N;Robotnicza->Dworzec PKP;Robotnicza->Dworzec PKP;Dworzec PKP;Dworzec PKP
+C;c;P;Y;Y;Terebelska->Robotnicza;Terebelska->Robotnicza;Robotnicza;Robotnicza
+C;d;P;N;N;Terebelska->Dworzec PKP;Terebelska->Dworzec PKP;Dworzec PKP;Dworzec PKP
+C;e;P;N;N;Dworzec PKP->Robotnicza;Dworzec PKP->Robotnicza;Robotnicza;Robotnicza
+C;f;T;N;N;Dworzec PKP->Terebelska;Dworzec PKP->Terebelska;Terebelska;Terebelska
+C;h;P;N;Y;Terebelska->Wólka Pleb.;Terebelska->Wólka Plebañska;Wólka Plebañska;Wólka Plebañska
+C;i;T;N;Y;Wólka Plebañska->Terebelska;Wólka Plebañska->Terebelska;Terebelska;Terebelska
+C;j;T;N;Y;Robotnicza->Cicibór Du¿y;Robotnicza->Cicibór Du¿y;Cicibór Du¿y;Cicibór Du¿y
+C;k;P;N;N;Cicibór Du¿y->Robotnicza;Cicibór Du¿y->Robotnicza;Robotnicza;Robotnicza
+C;l;P;N;Y;Cicibór ->Wólka Plebañska;Cicibór Du¿y->Wólka Plebañska;Wólka Plebañska;Wólka Plebañska
+C;m;P;N;Y;Terebelska->AK->Robotnicza;Terebelska->AK->Robotnicza;Robotnicza;Robotnicza
+C;n;T;N;Y;Robotnicza->AK->Terebelska;Robotnicza->AK->Terebelska;Terebelska;Terebelska
+C;w;T;N;N;Wólka Plebañska->Dworzec PKP;Wólka Plebañska->Dworzec PKP;Dworzec PKP;Dworzec PKP
+D;a;T;N;Y;Solidarnoœci->Rakowiska;Solidarnoœci->Rakowiska;Rakowiska;Rakowiska
+D;b;P;N;Y;Rakowiska->Solidarnoœci;Rakowiska->Solidarnoœci;Al. Solidarnoœci;Al. Solidarnoœci
+D;c;T;Y;Y;Solidarnoœci->Terebelska;Solidarnoœci->Terebelska;Terebelska;Terebelska
+D;d;P;Y;Y;Terebelska->Solidarnoœci;Terebelska->Solidarnoœci;Solidarnoœci;Solidarnoœci
+E;a;T;N;Y;Twarda->Solidarnoœci;Twarda->Solidarnoœci;Solidarnoœci;Solidarnoœci
+E;b;P;N;Y;Solidarnoœci->Twarda;Solidarnoœci->Twarda;Twarda;Twarda
+E;g;T;Y;Y;Twarda->Cmentarz Kom.;Twarda->Cmentarz Kom.;Cmentarz Komunalny;Cmentarz Komunalny
+E;h;P;Y;Y;Cmentarz Kom.->Twarda;Cmentarz Kom.->Twarda;Twarda;Twarda
+E;k;T;N;Y;Twarda->Solidarnoœci;Solidarnoœci;Solidarnoœci;Solidarnoœci
+E;l;P;N;Y;Solidarnoœci->Twarda;Twarda;Twarda;Twarda
+E;p;T;N;N;Twarda->Solidarnoœci;Twarda->Solidarnoœci;Solidarnoœci;Solidarnoœci
+E;r;T;N;N;Solidarnoœci->Twarda;Solidarnoœci->Twarda;Twarda;Twarda
+F;c;P;N;Y;Akademicka->Brzegowa;Akademicka->Brzegowa;Brzegowa;Brzegowa
+F;d;P;N;Y;Akademicka->Sidorska;Akademicka->Sidorska;Sidorska;Sidorska
+F;e;T;N;Y;Brzegowa->Akademicka Pêtla;Brzegowa->Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla
+F;f;T;Y;Y;Sidorska->Akademicka Pêtla;Sidorska->Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla
+F;h;P;Y;Y;Akademicka->Sidorska;Akademicka->Sidorska;Sidorska;Sidorska
+G;a;T;N;Y;Czosnówka->Al.Solidarnoœc;Czosnówka->Al.Solidarnoœci;Al.Solidarnoœci;Al.Solidarnoœci
+G;b;T;Y;Y;Czosnówka->Terebelska;Czosnówka->Terebelska;Terebelska;Terebelska
+G;c;T;N;N;Brzegowa->Terebelska;Brzegowa->Terebelska;Terebelska;Terebelska
+G;d;T;N;N;Sidorska->Terebelska;Sidorska->Terebelska;Terebelska;Terebelska
+G;e;P;N;Y;Al.Solidaroœci->Czosnówka;Al.Solidaroœci->Czosnówka;Czosnówka;Czosnówka
+G;f;P;Y;Y;Terebelska->Czosnówka;Terebelska->Czosnówka;Czosnówka;Czosnówka
+G;g;P;N;N;Terebelska->Brzegowa;Terebelska->Brzegowa;Brzegowa;Brzegowa
+G;h;P;N;N;Terebelska->Sidorska;Terebelska->Sidorska;Sidorska;Sidorska
+G;i;T;N;Y;Al.Solidarnoœci->Terebelska;Al.Solidarnoœci->Terebelska;Terebelska;Terebelska
+G;j;P;N;Y;Terebelska->Al.Solidarnoœci;Terebelska->Al.Solidarnoœci;Al.Solidarnoœci;Al.Solidarnoœci
+H;a;T;N;Y;Czosnówka->Terebelska;Czosnówka->Terebelska;Terebelska;Terebelska
+H;b;P;N;Y;Terebelska->Czosnówka;Terebelska->Czosnówka;Czosnówka;Czosnówka
+H;c;T;Y;Y;Sidorska->Terebelska;Sidorska->Terebelska;Terebelska;Terebelska
+H;d;P;Y;Y;Terebelska->Sidorska;Terebelska->Sidorska;Sidorska;Sidorska
+H;e;T;N;Y;Cmentarz Kom.->Terebelska;Cmentarz Kom.->Terebelska;Terebelska;Terebelska
+H;f;P;N;Y;Terebelska->Cmentarz Kom.;Terebelska->Cmentarz Kom.;Cmentarz Komunalny;Cmentarz Komunalny
+H;g;P;N;Y;Terebelska->Brzegowa;Terebelska->Brzegowa;Brzegowa;Brzegowa
+H;h;T;N;Y;Brzegowa->Terebelska;Brzegowa->Terebelska;Terebelska;Terebelska
+H;i;T;N;Y;Czosnówka->Terebela;Czosnówka->Terebela;Terebela;Terebela
+H;k;T;N;Y;Sidorska->Terebela;Sidorska->Terebela;Terebela;Terebela
+H;l;P;N;Y;Terebela->Czosnówka;Terebela->Czosnówka;Czosnówka;Czosnówka
+H;m;P;N;Y;Sidorska->Czosnówka;Sidorska->Czosnówka;Czosnówka;Czosnówka
+H;n;T;N;N;Solidarnoœci->Terebelska;Solidarnoœci->Terebelska;Terebelska;Terebelska
+I;f;T;Y;Y;Terebelska->Ch³odna;Terebelska->Ch³odna;Ch³odna;Ch³odna
+I;g;P;Y;Y;Ch³odna->Terebelska;Ch³odna->Terebelska;Terebelska;Terebelska
+I;i;P;N;Y;Ch³odna->Dworzec PKP;Ch³odna->Dworzec PKP;Dworzec PKP;Dworzec PKP
+I;j;T;N;Y;Dworzec PKP->Ch³odna;Dworzec PKP->Ch³odna;Ch³odna;Ch³odna
+K;A;T;N;Y;Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla
+K;B;P;N;Y;Cmentarz Kom.;Cmentarz Kom.;Cmentarz Kom.;
+K;D;P;N;Y;Al. Solidarnoœci;Al. Solidarnoœci;Al. Solidarnoœci;Al. Solidarnoœci
+K;E;T;Y;Y;Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla;Akademicka Pêtla
+K;F;P;Y;Y;Al. Solidarnoœci;Al. Solidarnoœci;Al. Solidarnoœci;Al. Solidarnoœci
+L;a;T;Y;Y;AK->Okopowa->Narutowicza;AK->Okopowa->Narutowicza;Narutowicza;Narutowicza
+L;b;P;Y;Y;Narutowicza->Okopowa->AK;Narutowicza->Okopowa->AK;Narutowicza;Narutowicza
+M;a;T;Y;Y;Grzybowa -> Terebelska;Grzybowa -> Terebelska;Terebelska;Terebelska
+M;b;P;Y;Y;Terebelska -> Grzybowa;Terebelska -> Grzybowa;Grzybowa;Grzybowa
+T;a;T;Y;Y;Cmentarz Kom.->Cmentarz Kom.;Cmentarz Kom.->Cmentarz Kom.;Cmentarz Komunalny;Cmentarz Komunalny
+T;b;T;N;Y;Francuska->Cmentarz Kom.;Francuska->Cmentarz Kom.;Cmentarz Komunalny;Cmentarz Komunalny
+T;c;T;Y;Y;Cmentarz Kom.->Sidorska;Cmentarz kom.->Sidorska;Sidorska;Sidorska

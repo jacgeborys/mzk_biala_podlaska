@@ -1,0 +1,4 @@
+data/cache/
+data/validation/
+tools/
+__pycache__/

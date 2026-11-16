@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_contact_url,feed_start_date,feed_end_date,feed_version
+Unofficial conversion of MZK Biała Podlaska timetable export,https://mzkbp.pl/,pl,https://mzkbp.pl/,20261110,20261231,1488_20261110
