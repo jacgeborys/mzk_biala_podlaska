@@ -1,16 +1,16 @@
-"""Flow cartogram: every street piece drawn as thick as the number of buses passing it in one day.
+"""Flow cartogram on a simplified street network: every edge drawn as thick as the buses passing it in a day.
 
-All shapes are noded into one network; each piece counts every pass of a shape running parallel
-to it within MERGE_M (either direction), or within DUAL_M on the same named OSM street (a loop
-shape using both carriageways, or an out-and-back spur, counts twice), so both
-directions are summed and both carriageways of a divided road / both halves of a split around a
-traffic island carry the street's full count; such pieces get a filler copy shifted halfway towards
-the other carriageway, so a divided road reads as one band. Beyond 2 m, parallel passes count only
-on the same street (OSM ref, else name), so close parallel streets (Chłodna / Twarda) stay apart. Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
-bar, legend box, credit line).
+1. corridors: all shapes of the day folded into one centreline per street (directions, carriageways, variants
+   within TOL m share it; cut ends re-attached where the route goes on)
+2. counts: each shape sampled every STEP_M m, each sample snapped to the nearest parallel corridor piece; a pass =
+   a run of samples on one piece in one direction (an out-and-back spur counts twice); trips added per 10 m bin
+   along the stretch the pass covers
+3. graph: the centreline noded at crossings and wherever the count steps (a branch folded into the corridor, a
+   route end); edges = runs between nodes with one value each (length-weighted median), so the count only
+   changes at nodes; short edges (roundabouts, staggered crossings) contracted into one node
 
-Output: png/cartogram_<date>.png, layer `segments` in data/gis/biala_podlaska_gtfs.gpkg
-        (one LineString per run of pieces with the same count: trips, lines)
+Output: png/cartogram_<date>[_city].png, layer `segments` in data/gis/biala_podlaska_gtfs.gpkg
+        (one LineString per edge: trips, lines)
 
 Usage:  python cartogram.py [--date 20261118] [--city]   (--city: frame on the city limits, drawn dashed)
 """
@@ -20,12 +20,13 @@ from pathlib import Path
 
 import geopandas as gpd
 import matplotlib
+import networkx as nx
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
 from shapely.geometry import LineString, Point, box
-from shapely.affinity import translate
-from shapely.ops import linemerge
+from shapely.ops import nearest_points, substring, unary_union
+from shapely.strtree import STRtree
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -39,11 +40,16 @@ GPKG = ROOT / "data" / "gis" / "biala_podlaska_gtfs.gpkg"
 LIMITS = ROOT / "data" / "gis" / "city_limits.gpkg"  # OSM relation 3016433 (Nominatim)
 CRS = "EPSG:2180"
 FRAME_ALL = (773970, 466100, 790310, 476690)   # all stops + 300 m (as animate_buses.py)
-MERGE_M = 20          # shapes this close and parallel count on the same piece (traffic islands)
-DUAL_M = 45           # ... and up to this far when both lie on the same named OSM street (dual carriageways)
-PARALLEL_DEG = 30
-SAMPLE_M = 5           # shapes sampled this often to count their passes
-SCALE_PCTL = 99.5      # widths / colours top out at this length percentile of counts (clipped above)
+TOL = 35              # m: shapes this close share one corridor (both directions, dual carriageways, variants)
+MIN_PART = 40         # m: shorter leftovers of the corridor folding are dropped
+DUP_M = 10            # m: corridor pieces overlapping another one within this distance are cut back
+PARALLEL_DEG = 35     # a sample snaps only to a corridor piece within this angle of its heading
+STEP_M = 5            # shapes sampled this often
+CONTRACT_M = 40       # nodes joined by shorter edges become one node (roundabouts, staggered crossings)
+SHORT_M = 60          # count steps closer than this are merged (corridor links and junctions: noisy counts)
+BIN_M = 10            # passes counted in bins of this length along each corridor piece
+SMOOTH_BINS = 5       # median filter over the bins (50 m)
+SIMPLIFY_M = 6        # drawn edge geometry simplified to this tolerance
 MAX_WIDTH_PT = 16
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
 
@@ -62,107 +68,243 @@ def bahn(size):
     return font_manager.FontProperties(family="sans-serif", size=size)
 
 
+def parts(g):
+    if g.is_empty:
+        return []
+    return [p for p in (g.geoms if hasattr(g, "geoms") else [g]) if isinstance(p, LineString)]
+
+
 def heading(g, d):
+    """Heading of line g at distance d (radians, over +-5 m)."""
     a = g.interpolate(max(0.0, d - 5))
     b = g.interpolate(min(g.length, d + 5))
-    return np.degrees(np.arctan2(b.y - a.y, b.x - a.x))
+    return np.arctan2(b.y - a.y, b.x - a.x)
 
 
-def piece_counts(date):
-    """Pieces of the noded union of all shapes, each with the trips of every shape running on it
-    or parallel to it within MERGE_M."""
-    from shapely.ops import unary_union
-    from shapely.strtree import STRtree
+def ang_diff(a, b):
+    """Smallest difference of two undirected headings, degrees."""
+    return abs((np.degrees(a - b) + 90) % 180 - 90)
+
+
+def key(c):
+    return round(c[0], 1), round(c[1], 1)
+
+
+def load(date):
     trips = pd.read_csv(GTFS / "trips.txt", dtype=str)
     cal = pd.read_csv(GTFS / "calendar_dates.txt", dtype=str)
     shapes = pd.read_csv(GTFS / "shapes.txt", dtype={"shape_id": str})
-    services = set(cal[(cal.date == date) & (cal.exception_type == "1")].service_id)
-    day = trips[trips.service_id.isin(services)]
+    day = trips[trips.service_id.isin(set(cal[(cal.date == date) & (cal.exception_type == "1")].service_id))]
     n_shape = day.groupby("shape_id").size()
+    line_of = day.drop_duplicates("shape_id").set_index("shape_id").route_id
     tr = Transformer.from_crs("EPSG:4326", CRS, always_xy=True)
-
-    sids, geoms = [], []
+    geoms = {}
     for sid, g in shapes[shapes.shape_id.isin(n_shape.index)].sort_values(
             ["shape_id", "shape_pt_sequence"]).groupby("shape_id"):
         x, y = tr.transform(g.shape_pt_lon.values, g.shape_pt_lat.values)
-        sids.append(sid)
-        geoms.append(LineString(zip(x, y)))
-    tree = STRtree(geoms)
-    street = street_namer()
-    # each shape sampled every SAMPLE_M with its heading, to count its separate passes near a piece
-    samples = []
-    for g in geoms:
-        d = np.arange(0, g.length, SAMPLE_M)
-        xy = np.array([g.interpolate(t).coords[0] for t in d])
-        hd = np.array([heading(g, t) for t in d])
-        samples.append((xy, hd))
-    noded = unary_union(geoms)
-    pieces = []
-    for piece in (noded.geoms if hasattr(noded, "geoms") else [noded]):
-        mid = piece.interpolate(0.5, normalized=True)
-        h = heading(piece, piece.length / 2)
-        key = street(mid)
-        total, lines = 0, set()
-        other = None  # nearest pass on the other carriageway of the same street (offset from the piece)
-        for i in tree.query(mid.buffer(DUAL_M)):
-            xy, hd = samples[i]
-            dist = np.hypot(xy[:, 0] - mid.x, xy[:, 1] - mid.y)
-            near = np.flatnonzero(dist <= DUAL_M)
-            if len(near) == 0:
+        geoms[sid] = LineString(zip(x, y)).simplify(2)
+    return geoms, n_shape, line_of, len(day)
+
+
+# ---------------------------------------------------------------- 1-2: corridors and graph
+def corridors(geoms, n_shape):
+    """One centreline per street: shapes added busiest first, each keeping only what lies farther than TOL from
+    the corridors so far; every cut end linked to the corridor its route continues on (40 m past the cut)."""
+    kept, src = [], []
+    for s in sorted(geoms, key=lambda s: -n_shape[s]):
+        g = geoms[s]
+        rest = g.difference(unary_union(kept).buffer(TOL)) if kept else g
+        for p in parts(rest):
+            if p.length >= MIN_PART:
+                kept.append(p)
+                src.append(g)
+    links = []
+    tree = STRtree(kept)
+    for i, (p, g) in enumerate(zip(kept, src)):
+        for at_start, end in ((True, Point(p.coords[0])), (False, Point(p.coords[-1]))):
+            d = g.project(end)
+            if d < 1 or d > g.length - 1:            # a real route end, not a cut
                 continue
-            # one pass = a run of consecutive samples near the piece (a loop or an out-and-back shape passes twice)
-            for run in np.split(near, np.flatnonzero(np.diff(near) > 1) + 1):
-                k = run[np.argmin(dist[run])]
-                if dist[k] > 1.0 + SAMPLE_M / 2:  # not the piece's own course: a parallel carriageway ...
-                    if abs((hd[k] - h + 90) % 180 - 90) > PARALLEL_DEG:
-                        continue
-                    k_key = street(Point(xy[k]))
-                    same = bool(key) and k_key == key            # ... of the same street (ref, else name)
-                    unnamed_island = not key and not k_key and dist[k] <= MERGE_M
-                    if not (same or unnamed_island):
-                        continue
-                    if other is None or dist[k] < np.hypot(*other):
-                        other = (xy[k][0] - mid.x, xy[k][1] - mid.y)
-                total += int(n_shape[sids[i]])
-                lines.add(sids[i].split("_")[0])
-        if total:
-            pieces.append((piece, total, ",".join(sorted(lines)), other))
-    return pieces, len(day)
+            ahead = g.interpolate(d - 40 if at_start else d + 40)
+            cand = [j for j in tree.query(ahead.buffer(TOL + 30)) if j != i]
+            if not cand:
+                continue
+            j = min(cand, key=lambda j: kept[j].distance(ahead))
+            if kept[j].distance(ahead) > TOL + 30:
+                continue
+            q = kept[j].interpolate(kept[j].project(ahead))
+            if end.distance(q) > 0.5:
+                links.append(LineString([end, q]))
+    # a shape is not folded against itself: a loop or out-and-back running back on its own street leaves a second
+    # copy of that street (the Dworzec PKP spur); such overlaps are cut from the shorter piece and its ends relinked
+    acc, relinks = [], []
+    for p in sorted(parts(unary_union(kept + links)), key=lambda p: -p.length):
+        near = unary_union(acc).buffer(DUP_M) if acc else None
+        if near is None or p.intersection(near).length <= 3 * DUP_M:
+            acc.append(p)
+            continue
+        base = unary_union(acc)
+        for r in parts(p.difference(near)):
+            if r.length < MIN_PART:
+                continue
+            acc.append(r)
+            for end in (Point(r.coords[0]), Point(r.coords[-1])):
+                if base.distance(end) <= DUP_M + 1:
+                    relinks.append(LineString([end, nearest_points(base, end)[0]]))
+    return parts(unary_union(acc + relinks))
 
 
-def street_namer():
-    """Point -> street of the nearest drivable edge within 8 m: its road number (ref) if it has one, else its
-    name ('' if neither). DK2's carriageways are partly named Białka, partly unnamed, all ref 2."""
-    import osmnx as ox
-    from shapely.strtree import STRtree
-    e = ox.graph_to_gdfs(ox.load_graphml(ROOT / "data" / "cache" / "osm_drive_service.graphml"), nodes=False)
-    def key(ref, name):
-        v = ref if isinstance(ref, (str, list)) else name
-        return v if isinstance(v, str) else "/".join(v) if isinstance(v, list) else ""
-    e = e[e["name"].notna() | e["ref"].notna()].to_crs(CRS)
-    names = [key(r, n) for r, n in zip(e["ref"], e["name"])]
-    lines = list(e.geometry)
-    tree = STRtree(lines)
+# ---------------------------------------------------------------- 3: passes, counted along each piece
+def piece_profiles(pieces, geoms, n_shape, line_of):
+    """Trips per BIN_M bin along every piece. Samples snap to the nearest parallel piece within TOL + 8 m; a pass
+    is a run of consecutive samples on one piece in one direction and adds its trips only to the bins it runs
+    along, so a piece carrying a folded-in branch (no junction there) still shows where the count steps."""
+    tree = STRtree(pieces)
+    names = sorted(set(line_of))
+    prof = [np.zeros(int(np.ceil(p.length / BIN_M))) for p in pieces]
+    on = [np.zeros((len(t), len(names)), bool) for t in prof]
+    for sid, g in geoms.items():
+        seq, pos = [], []  # (piece, direction) and position along the piece per sample
+        for d in np.arange(0, g.length, STEP_M):
+            pt = g.interpolate(d)
+            h = heading(g, d)
+            best = None
+            for i in tree.query(pt.buffer(TOL + 8)):
+                dist = pieces[i].distance(pt)
+                if dist > TOL + 8:
+                    continue
+                t = pieces[i].project(pt)
+                hp = heading(pieces[i], t)
+                if ang_diff(hp, h) <= PARALLEL_DEG and (best is None or dist < best[0]):
+                    best = (dist, i, bool(np.cos(hp - h) > 0), t)
+            seq.append(best[1:3] if best else None)
+            pos.append(best[3] if best else 0.0)
+        k = 0
+        while k < len(seq):
+            j = k
+            while j + 1 < len(seq) and seq[j + 1] == seq[k]:
+                j += 1
+            if seq[k] is not None:
+                i = seq[k][0]
+                lo, hi = min(pos[k:j + 1]) - STEP_M / 2, max(pos[k:j + 1]) + STEP_M / 2
+                b0, b1 = max(0, int(lo // BIN_M)), min(len(prof[i]), int(hi // BIN_M) + 1)
+                prof[i][b0:b1] += n_shape[sid]
+                on[i][b0:b1, names.index(line_of[sid])] = True
+            k = j + 1
+    return prof, on, names
 
-    def name_at(p):
-        idx = tree.query(p.buffer(8))
-        if len(idx) == 0:
-            return ""
-        return names[min(idx, key=lambda i: lines[i].distance(p))]
-    return name_at
+
+def split_by_profile(pieces, prof, on, names):
+    """Pieces cut where their count steps: profile median-filtered over SMOOTH_BINS bins (junction noise), runs
+    shorter than SHORT_M merged into the neighbour with the closer value. Each part: trips = median of its bins."""
+    items = []
+    for p, t, o in zip(pieces, prof, on):
+        h = SMOOTH_BINS // 2
+        pad = np.concatenate([np.repeat(t[:1], h), t, np.repeat(t[-1:], h)])
+        sm = np.array([np.median(pad[k:k + SMOOTH_BINS]) for k in range(len(t))])
+        cuts = [0] + [k for k in range(1, len(t)) if sm[k] != sm[k - 1]] + [len(t)]
+        runs = [[a, b, float(np.median(t[a:b]))] for a, b in zip(cuts, cuts[1:])]
+        while len(runs) > 1:
+            k = min(range(len(runs)), key=lambda k: runs[k][1] - runs[k][0])
+            if (runs[k][1] - runs[k][0]) * BIN_M >= SHORT_M:
+                break
+            nb = [m for m in (k - 1, k + 1) if 0 <= m < len(runs)]
+            m = min(nb, key=lambda m: abs(runs[m][2] - runs[k][2]))
+            a, b = min(runs[k][0], runs[m][0]), max(runs[k][1], runs[m][1])
+            runs[min(k, m)] = [a, b, float(np.median(t[a:b]))]
+            del runs[max(k, m)]
+        for a, b, v in runs:
+            g = substring(p, a * BIN_M, min(b * BIN_M, p.length)) if len(runs) > 1 else p
+            items.append(dict(geom=g, pt=v, u=key(g.coords[0]), v=key(g.coords[-1]),
+                              pl={l: o[a:b, n].sum() * BIN_M for n, l in enumerate(names) if o[a:b, n].any()}))
+    return items
 
 
-def merged_segments(pieces):
-    """Join pieces with the same count and line set into longer LineStrings (for the gpkg)."""
-    groups = defaultdict(list)
-    for g, n, ls, _ in pieces:
-        groups[(n, ls)].append(g)
-    rows = []
-    for (n, ls), segs in groups.items():
-        m = linemerge(segs)
-        for g in (m.geoms if hasattr(m, "geoms") else [m]):
-            rows.append(dict(trips=n, lines=ls, n_lines=len(ls.split(",")), geometry=g))
-    return gpd.GeoDataFrame(rows, crs=CRS)
+# ---------------------------------------------------------------- 3b: edges with one value each
+def chain(items):
+    """Join items {geom, u, v, ...} through nodes of degree 2 when their values are equal or one of them is
+    shorter than SHORT_M (a different value on two longer pieces is a real step: a branch folded into the corridor
+    leaves no junction, e.g. the Dworzec PKP spur). The joined item keeps its source pieces in `parts`."""
+    items = [dict(it, parts=it.get("parts", [it])) for it in items]
+    for it in items:
+        it["trips"], it["lines"] = edge_value(it)
+    changed = True
+    while changed:
+        changed = False
+        inc = defaultdict(list)
+        for i, e in enumerate(items):
+            inc[e["u"]].append(i)
+            inc[e["v"]].append(i)
+        for n, es in inc.items():
+            if len(es) != 2 or es[0] == es[1]:
+                continue
+            a, b = items[es[0]], items[es[1]]
+            if a["trips"] != b["trips"] and min(a["geom"].length, b["geom"].length) >= SHORT_M:
+                continue
+            ca = list(a["geom"].coords) if a["v"] == n else list(a["geom"].coords)[::-1]
+            cb = list(b["geom"].coords) if b["u"] == n else list(b["geom"].coords)[::-1]
+            g = LineString(ca + cb[1:])
+            merged = dict(geom=g, u=key(g.coords[0]), v=key(g.coords[-1]), parts=a["parts"] + b["parts"])
+            merged["trips"], merged["lines"] = edge_value(merged)
+            items = [it for k, it in enumerate(items) if k not in es] + [merged]
+            changed = True
+            break
+    return items
+
+
+def edge_value(e):
+    """Length-weighted median of the source pieces' trips; lines covering at least half of the edge."""
+    ps = e["parts"]
+    t = np.array([p["pt"] for p in ps])
+    L = np.array([p["geom"].length for p in ps])
+    o = np.argsort(t)
+    trips = int(t[o][np.searchsorted(np.cumsum(L[o]), L.sum() / 2)])
+    cover = defaultdict(float)
+    for p in ps:
+        for l, v in p["pl"].items():
+            cover[l] += min(v, p["geom"].length)
+    return trips, frozenset(l for l, v in cover.items() if v >= 0.5 * L.sum())
+
+
+def contract_short(edges):
+    """Nodes joined by edges shorter than CONTRACT_M become one node at their centre (dead ends are kept)."""
+    deg = defaultdict(int)
+    for e in edges:
+        deg[e["u"]] += 1
+        deg[e["v"]] += 1
+    G = nx.Graph()
+    G.add_edges_from((e["u"], e["v"]) for e in edges
+                     if e["geom"].length < CONTRACT_M and e["u"] != e["v"] and deg[e["u"]] > 1 and deg[e["v"]] > 1)
+    rep = {}
+    for comp in nx.connected_components(G):
+        c = tuple(np.round(np.array(list(comp)).mean(axis=0), 1))
+        for n in comp:
+            rep[n] = c
+    out = []
+    for e in edges:
+        u, v = rep.get(e["u"], e["u"]), rep.get(e["v"], e["v"])
+        if u == v and e["geom"].length < CONTRACT_M:
+            continue
+        coords = list(e["geom"].coords)
+        coords[0], coords[-1] = u, v
+        out.append(dict(e, geom=LineString(coords), u=u, v=v))
+    return out
+
+
+def network(date):
+    geoms, n_shape, line_of, n_trips = load(date)
+    pieces = corridors(geoms, n_shape)
+    items = split_by_profile(pieces, *piece_profiles(pieces, geoms, n_shape, line_of))
+    edges = [e for e in chain(items) if e["trips"] > 0]   # junction to junction, route end or real step
+    edges = chain(contract_short(edges))       # roundabouts to one node, then neighbours joined again
+    print(f"network: {len(pieces)} corridor pieces, {len(items)} after cuts at steps -> {len(edges)} edges, "
+          f"{len({n for e in edges for n in (e['u'], e['v'])})} nodes")
+    return edges, n_trips
+
+
+def segments_gdf(edges):
+    return gpd.GeoDataFrame([dict(trips=e["trips"], lines=",".join(sorted(e["lines"])), n_lines=len(e["lines"]),
+                                  geometry=e["geom"]) for e in edges], crs=CRS)
 
 
 def width_of(v, vmax):
@@ -173,17 +315,7 @@ def color_of(v, vmax):
     return plt.get_cmap("plasma")(0.25 + 0.75 * np.sqrt(min(v, vmax) / vmax))
 
 
-def scale_max(pieces):
-    """Count at which SCALE_PCTL % of the network length is reached: short extremes (the Dworzec PKP spur,
-    passed in and out by every bus going there) are drawn at full width without thinning everything else."""
-    n = np.array([p[1] for p in pieces])
-    L = np.array([p[0].length for p in pieces])
-    o = np.argsort(n)
-    cum = np.cumsum(L[o]) / L.sum()
-    return int(n[o][np.searchsorted(cum, SCALE_PCTL / 100)])
-
-
-def draw(pieces, n_trips, date, frame, out, limits=None, caps="round", cap=True):
+def draw(edges, n_trips, date, frame, out, limits=None):
     w, h = frame[2] - frame[0], frame[3] - frame[1]
     map_w = PAGE_W_IN - 2 * MARGIN_IN
     map_h = map_w * h / w
@@ -215,51 +347,22 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round", cap=True)
     if limits is not None:
         limits.boundary.plot(ax=ax, color="#8a8a96", linewidth=1.0, linestyle=(0, (4, 3)), zorder=2, aspect=None)
 
-    pieces = sorted(pieces, key=lambda p: p[1])  # busiest drawn last, on top
-    n = np.array([p[1] for p in pieces])
-    vmax = scale_max(pieces) if cap else int(max(p[1] for p in pieces))
-    top = int(n.max())
-    if caps == "flat":
-        # runs of equal count merged into continuous lines, flat ends: width steps meet squarely and branches
-        # leave the trunk without the round bulbs every short piece gets with round caps
-        runs = defaultdict(list)
-        for g, v, _, _ in pieces:
-            runs[v].append(g)
-        segs, vals = [], []
-        for v in sorted(runs):
-            m = linemerge(runs[v])
-            for g in (m.geoms if hasattr(m, "geoms") else [m]):
-                segs.append(list(g.coords))
-                vals.append(v)
-        vals = np.array(vals)
-        ax.add_collection(LineCollection(segs, linewidths=width_of(vals, vmax),
-                                         colors=[color_of(v, vmax) for v in vals], capstyle="butt",
-                                         joinstyle="round", zorder=3))
-    else:
-        # every piece where it is (stays connected), flat ends: round caps on hundreds of short pieces bulge
-        # wherever the width changes. Bends are closed by a dot at each joint, as wide as the thinnest piece
-        # meeting there (fills the notch, never sticks out of a thicker line); dead ends stay flat.
-        # A carriageway of a divided road gets a filler copy shifted halfway towards the other one, so both
-        # carriageways and the gap between them read as one street.
-        segs = [list(p[0].coords) for p in pieces]
-        segs += [list(translate(p[0], p[3][0] / 2, p[3][1] / 2).coords) for p in pieces if p[3] is not None]
-        vals = np.concatenate([n, [p[1] for p in pieces if p[3] is not None]])
-        joint = defaultdict(list)
-        for c, v in zip(segs, vals):
-            for end in (c[0], c[-1]):
-                joint[(round(end[0], 1), round(end[1], 1))].append(v)
-        jx, jv = [], []
-        for xy, vs in joint.items():
-            if len(vs) > 1:
-                jx.append(xy)
-                jv.append(min(vs))
-        jx, jv = np.array(jx), np.array(jv)
-        ax.scatter(jx[:, 0], jx[:, 1], s=width_of(jv, vmax) ** 2, c=[color_of(v, vmax) for v in jv],
-                   linewidths=0, zorder=3)
-        order = np.argsort(vals, kind="stable")
-        ax.add_collection(LineCollection([segs[i] for i in order], linewidths=width_of(vals[order], vmax),
-                                         colors=[color_of(v, vmax) for v in vals[order]], capstyle="butt",
-                                         joinstyle="round", zorder=3.1))
+    # one line per edge, flat ends; each node gets a dot as wide as the second-widest edge there, which closes
+    # the bend of a line passing through without sticking out where a thick edge simply continues as a thin one
+    edges = sorted(edges, key=lambda e: e["trips"])  # busiest drawn last, on top
+    vals = np.array([e["trips"] for e in edges])
+    vmax = top = int(vals.max())
+    at = defaultdict(list)
+    for e in edges:
+        at[e["u"]].append(e["trips"])
+        at[e["v"]].append(e["trips"])
+    jx = np.array([n for n, vs in at.items() if len(vs) > 1])
+    jv = np.array([sorted(vs)[-2] for vs in at.values() if len(vs) > 1])
+    ax.scatter(jx[:, 0], jx[:, 1], s=width_of(jv, vmax) ** 2, c=[color_of(v, vmax) for v in jv],
+               linewidths=0, zorder=3)
+    ax.add_collection(LineCollection([list(e["geom"].simplify(SIMPLIFY_M).coords) for e in edges],
+                                     linewidths=width_of(vals, vmax), colors=[color_of(v, vmax) for v in vals],
+                                     capstyle="butt", joinstyle="round", zorder=3.1))
 
     # header (as TransitFrequency's draw_headline: city name two rows tall, question + date beside it)
     halo = [patheffects.withStroke(linewidth=6, foreground=PAGE, alpha=0.55)]
@@ -326,23 +429,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", default="20261118")
     ap.add_argument("--city", action="store_true", help="frame on the city limits (+400 m) instead of all stops")
-    ap.add_argument("--caps", choices=["round", "flat"], default="round", help="line ends: round pieces or flat runs")
-    ap.add_argument("--no-cap", action="store_true", help="scale widths to the real maximum (the PKP spur) instead of the 99.5th percentile")
     ap.add_argument("--out", help="output PNG (default png/cartogram_<date>[_city].png)")
     args = ap.parse_args()
 
-    pieces, n_trips = piece_counts(args.date)
-    seg = merged_segments(pieces)
+    edges, n_trips = network(args.date)
+    seg = segments_gdf(edges)
     seg.to_file(GPKG, layer="segments", driver="GPKG")
-    print(f"segments: {len(seg)} lines, busiest {seg.trips.max()} buses/day "
+    print(f"segments: {len(seg)} edges, busiest {seg.trips.max()} buses/day "
           f"({seg.sort_values('trips').iloc[-1].lines}) -> {GPKG.name}:segments")
     out = Path(args.out) if args.out else ROOT / "png" / f"cartogram_{args.date}{'_city' if args.city else ''}.png"
     if args.city:
         limits = gpd.read_file(LIMITS).to_crs(CRS)
         x0, y0, x1, y1 = limits.total_bounds
-        draw(pieces, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits, args.caps, not args.no_cap)
+        draw(edges, n_trips, args.date, (x0 - 400, y0 - 400, x1 + 400, y1 + 400), out, limits)
     else:
-        draw(pieces, n_trips, args.date, FRAME_ALL, out, caps=args.caps, cap=not args.no_cap)
+        draw(edges, n_trips, args.date, FRAME_ALL, out)
 
 
 if __name__ == "__main__":
