@@ -50,6 +50,8 @@ SHORT_M = 60          # count steps closer than this are merged (corridor links 
 BIN_M = 10            # passes counted in bins of this length along each corridor piece
 SMOOTH_BINS = 5       # median filter over the bins (50 m)
 SIMPLIFY_M = 6        # drawn edge geometry simplified to this tolerance
+RB_MARGIN_M = 10      # roundabouts: edges cut this far outside the ring and joined straight to one node
+RB_MAX_R = 60         # rings with a larger radius are left as they are
 LOOP_M = 250          # edges starting and ending at the same node shorter than this are turning loops (dropped)
 SPLIT_SUM = 1.15      # a node is a split / merge when the other forward edges' trips add up to at most this x the trunk
 TAPER_M = 180         # a stacked branch eases from its slot in the trunk to its own centreline over this length
@@ -317,6 +319,64 @@ def contract_short(edges):
     return out
 
 
+def roundabouts():
+    """(centre, radius) of every OSM roundabout (junction=roundabout rings), EPSG:2180."""
+    import osmnx as ox
+    e = ox.graph_to_gdfs(ox.load_graphml(ROOT / "data" / "cache" / "osm_drive_service.graphml"), nodes=False)
+    e = e[e["junction"] == "roundabout"].to_crs(CRS)
+    G = nx.Graph()
+    for (u, v, _), g in zip(e.index, e.geometry):
+        G.add_edge(u, v, g=g)
+    out = []
+    for comp in nx.connected_components(G):
+        ring = unary_union([d["g"] for _, _, d in G.subgraph(comp).edges(data=True)])
+        c = ring.convex_hull.centroid
+        r = max(Point(xy).distance(c) for g in parts(ring) for xy in g.coords)
+        if r <= RB_MAX_R:
+            out.append((c, r))
+    return out
+
+
+def straighten_roundabouts(edges):
+    """At every roundabout the network touches, edges are cut RB_MARGIN_M outside the ring and joined by straight
+    spokes to one node (trip-weighted mean of the cut points): no arcs around the ring. Geometry only (counts
+    unchanged); an edge passing through is split there and joined again by chain()."""
+    n = 0
+    for c, r in roundabouts():
+        R = r + RB_MARGIN_M
+        if not any(e["geom"].distance(c) < R for e in edges):
+            continue
+        n += 1
+        disk = c.buffer(R)
+        out, cut = [], []
+        for e in edges:
+            if e["geom"].distance(c) >= R:
+                out.append(e)
+                continue
+            for g in parts(e["geom"].difference(disk)):
+                xy = list(g.coords)
+                ends = [Point(xy[0]).distance(c) < R + 0.5, Point(xy[-1]).distance(c) < R + 0.5]
+                cut += [(xy[0] if k == 0 else xy[-1], e["trips"]) for k in (0, 1) if ends[k]]
+                out.append((e, xy, ends))
+        if not cut:
+            continue
+        # the node: trip-weighted mean of the cut points, so the busiest line through stays (nearly) straight
+        w = np.array([t for _, t in cut], float)
+        m = tuple(np.round((np.array([xy for xy, _ in cut]) * w[:, None]).sum(axis=0) / w.sum(), 1))
+        res = []
+        for o in out:
+            if isinstance(o, dict):
+                res.append(o)
+                continue
+            e, xy, ends = o
+            xy = ([m] if ends[0] else []) + xy + ([m] if ends[1] else [])
+            res.append(dict(e, geom=LineString(xy), u=key(xy[0]), v=key(xy[-1])))
+        out = res
+        edges = out
+    print(f"roundabouts straightened: {n}")
+    return edges
+
+
 def network(date):
     geoms, n_shape, line_of, n_trips = load(date)
     pieces = corridors(geoms, n_shape)
@@ -324,7 +384,7 @@ def network(date):
     edges = [e for e in chain(items) if e["trips"] > 0]   # junction to junction, route end or real step
     edges = [e for e in contract_short(edges)          # roundabouts to one node; turning loops (their buses are
              if not (e["u"] == e["v"] and e["geom"].length < LOOP_M)]   # counted on the way in and out) dropped
-    edges = chain(edges)                       # neighbours joined again
+    edges = chain(straighten_roundabouts(edges))   # roundabouts as one node, neighbours joined again
     print(f"network: {len(pieces)} corridor pieces, {len(items)} after cuts at steps -> {len(edges)} edges, "
           f"{len({n for e in edges for n in (e['u'], e['v'])})} nodes")
     return edges, n_trips
