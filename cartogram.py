@@ -1,9 +1,11 @@
 """Flow cartogram: every street piece drawn as thick as the number of buses passing it in one day.
 
-All shapes are noded into one network; each piece counts every shape running parallel to it
-within MERGE_M (either direction), or within DUAL_M on the same named OSM street, so both
+All shapes are noded into one network; each piece counts every pass of a shape running parallel
+to it within MERGE_M (either direction), or within DUAL_M on the same named OSM street (a loop
+shape using both carriageways, or an out-and-back spur, counts twice), so both
 directions are summed and both carriageways of a divided road / both halves of a split around a
-traffic island carry the street's full count (drawn on top of each other they read as one band). Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
+traffic island carry the street's full count; such pieces are shifted halfway towards the other
+carriageway, so a divided road is drawn once, on its middle line. Layout follows the TransitFrequency posters (Bahnschrift header, frame, scale
 bar, legend box, credit line).
 
 Output: png/cartogram_<date>.png, layer `segments` in data/gis/biala_podlaska_gtfs.gpkg
@@ -20,7 +22,8 @@ import matplotlib
 import numpy as np
 import pandas as pd
 from pyproj import Transformer
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Point, box
+from shapely.affinity import translate
 from shapely.ops import linemerge
 
 matplotlib.use("Agg")
@@ -38,6 +41,8 @@ FRAME_ALL = (773970, 466100, 790310, 476690)   # all stops + 300 m (as animate_b
 MERGE_M = 20          # shapes this close and parallel count on the same piece (traffic islands)
 DUAL_M = 45           # ... and up to this far when both lie on the same named OSM street (dual carriageways)
 PARALLEL_DEG = 30
+SAMPLE_M = 5           # shapes sampled this often to count their passes
+SCALE_PCTL = 99.5      # widths / colours top out at this length percentile of counts (clipped above)
 MAX_WIDTH_PT = 16
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
 
@@ -83,28 +88,45 @@ def piece_counts(date):
         geoms.append(LineString(zip(x, y)))
     tree = STRtree(geoms)
     street = street_namer()
+    # each shape sampled every SAMPLE_M with its heading, to count its separate passes near a piece
+    samples = []
+    for g in geoms:
+        d = np.arange(0, g.length, SAMPLE_M)
+        xy = np.array([g.interpolate(t).coords[0] for t in d])
+        hd = np.array([heading(g, t) for t in d])
+        samples.append((xy, hd))
     noded = unary_union(geoms)
     pieces = []
     for piece in (noded.geoms if hasattr(noded, "geoms") else [noded]):
         mid = piece.interpolate(0.5, normalized=True)
         h = heading(piece, piece.length / 2)
-        hits = []
         name = None
+        total, lines = 0, set()
+        other = None  # nearest pass on another carriageway (offset from the piece), to draw the street once
         for i in tree.query(mid.buffer(DUAL_M)):
-            g = geoms[i]
-            dist = g.distance(mid)
-            if dist > 1.0:  # the piece's own shapes are always in; others must run parallel ...
-                dh = abs((heading(g, g.project(mid)) - h + 90) % 180 - 90)
-                if dh > PARALLEL_DEG:
-                    continue
-                if dist > MERGE_M:  # ... and beyond MERGE_M lie on the same named street
-                    name = street(mid) if name is None else name
-                    if not name or street(g.interpolate(g.project(mid))) != name:
+            xy, hd = samples[i]
+            dist = np.hypot(xy[:, 0] - mid.x, xy[:, 1] - mid.y)
+            near = np.flatnonzero(dist <= DUAL_M)
+            if len(near) == 0:
+                continue
+            # one pass = a run of consecutive samples near the piece (a loop or an out-and-back shape passes twice)
+            for run in np.split(near, np.flatnonzero(np.diff(near) > 1) + 1):
+                k = run[np.argmin(dist[run])]
+                if dist[k] > 1.0 + SAMPLE_M / 2:  # not the piece's own course: must run parallel ...
+                    if abs((hd[k] - h + 90) % 180 - 90) > PARALLEL_DEG:
                         continue
-            hits.append(i)
-        if hits:
-            pieces.append((piece, sum(int(n_shape[sids[i]]) for i in hits),
-                           ",".join(sorted({sids[i].split("_")[0] for i in hits}))))
+                    if dist[k] > MERGE_M:  # ... and beyond MERGE_M lie on the same named street
+                        name = street(mid) if name is None else name
+                        if not name or street(Point(xy[k])) != name:
+                            continue
+                total += int(n_shape[sids[i]])
+                lines.add(sids[i].split("_")[0])
+                if dist[k] > 2.0 and (other is None or dist[k] < np.hypot(*other)):
+                    other = (xy[k][0] - mid.x, xy[k][1] - mid.y)
+        if total:
+            if other is not None:  # dual carriageway / island split: both halves move onto the middle line
+                piece = translate(piece, other[0] / 2, other[1] / 2)
+            pieces.append((piece, total, ",".join(sorted(lines))))
     return pieces, len(day)
 
 
@@ -140,11 +162,21 @@ def merged_segments(pieces):
 
 
 def width_of(v, vmax):
-    return 0.6 + (MAX_WIDTH_PT - 0.6) * v / vmax
+    return 0.6 + (MAX_WIDTH_PT - 0.6) * np.minimum(v, vmax) / vmax
 
 
 def color_of(v, vmax):
-    return plt.get_cmap("plasma")(0.25 + 0.75 * np.sqrt(v / vmax))
+    return plt.get_cmap("plasma")(0.25 + 0.75 * np.sqrt(min(v, vmax) / vmax))
+
+
+def scale_max(pieces):
+    """Count at which SCALE_PCTL % of the network length is reached: short extremes (the Dworzec PKP spur,
+    passed in and out by every bus going there) are drawn at full width without thinning everything else."""
+    n = np.array([p[1] for p in pieces])
+    L = np.array([p[0].length for p in pieces])
+    o = np.argsort(n)
+    cum = np.cumsum(L[o]) / L.sum()
+    return int(n[o][np.searchsorted(cum, SCALE_PCTL / 100)])
 
 
 def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
@@ -181,7 +213,8 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
 
     pieces = sorted(pieces, key=lambda p: p[1])  # busiest drawn last, on top
     n = np.array([p[1] for p in pieces])
-    vmax = n.max()
+    vmax = scale_max(pieces)
+    top = int(n.max())
     if caps == "flat":
         # runs of equal count merged into continuous lines, flat ends: width steps meet squarely and branches
         # leave the trunk without the round bulbs every short piece gets with round caps
@@ -239,7 +272,8 @@ def draw(pieces, n_trips, date, frame, out, limits=None, caps="round"):
     for i, v in enumerate(ticks):
         y = lh_in - 0.62 - i * row_in
         lax.plot([0.18, 1.05], [y, y], lw=width_of(v, vmax), color=color_of(v, vmax), solid_capstyle="round")
-        lax.text(1.3, y, f"{v}" + ("  (maks.)" if v == int(vmax) else ""), ha="left", va="center",
+        label = f"{v}" if v < vmax else (f"{v}+" if top > vmax else f"{v}  (maks.)")
+        lax.text(1.3, y, label, ha="left", va="center",
                  fontproperties=bahn(12), color=INK)
 
     # scale bar + north arrow, bottom left
