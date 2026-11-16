@@ -56,7 +56,7 @@ U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
-U_TOP_M = 170        # ... over which the legs peel apart below the crossing
+U_TOP_M = 170        # ... over which the legs reach their place below the crossing
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -401,18 +401,17 @@ def station_access(edges, stations):
         u_lines = L - kos_lines - end_lines                           # round the U and back up
         trips = e.get("trips", {})
         tr = lambda ls: {l: trips.get(l, 0) for l in ls}  # noqa: E731
-        # the U, drawn as is (no simplification): legs peel apart from the crossing on S-curves, run straight
-        # down, and meet in a half circle whose lowest point is the station
+        # the U, drawn as is (no simplification): legs leave the crossing diagonally, run straight down, and
+        # meet in a half circle whose lowest point is the station
         C = P0 + dv * (U_DEPTH_M - U_HALF_M)
         Sx = P0 + dv * U_DEPTH_M
         ss = lambda t: t * t * (3 - 2 * t)  # noqa: E731
         down = u_lines | kos_lines | end_lines
-        st = {-1: len(u_lines) * SPACING / 2, 1: len(down) * SPACING / 2}   # the legs leave side by side
 
         def leg(sign):
-            # sideways: first to its place beside the other leg (over 60 m), then on out to U_HALF_M
-            off = lambda t: st[sign] * ss(min(1.0, t * U_TOP_M / 60)) + (U_HALF_M - st[sign]) * ss(t)  # noqa: E731
-            top = [P0 + dv * (U_TOP_M * t) + sign * perp * off(t) for t in np.linspace(0, 1, 35)]
+            # a few long straight pieces (diagonal off the crossing, straight down), so that the corners, the one
+            # at the crossing included, are rounded with full-size arcs; the bottom is a half circle
+            top = [P0, P0 + dv * U_TOP_M + sign * perp * U_HALF_M]
             arc = [C + sign * perp * U_HALF_M * math.cos(a) + dv * U_HALF_M * math.sin(a)
                    for a in np.linspace(0, math.pi / 2, 19)]
             return [tuple(p) for p in top + arc]
