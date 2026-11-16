@@ -48,8 +48,10 @@ MIN_PART = 40       # m: shorter leftovers of the corridor dedupe are dropped
 PARALLEL_DEG = 35
 SPACING = 26        # m between lanes of a bundle
 STEP_M = 6          # drawn lines are sampled this often
-CURVE_M = 45        # centreline smoothing window: corners become curves of roughly this size
-RAMP_M = 80         # a line changing lane at a junction moves over this length (no jag)
+SIMPLIFY_M = 30     # sections are simplified this much before their corners are rounded (street wiggles go)
+CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
+RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
+STATION_DROP_M = 160  # Dworzec PKP: the through lines continue straight on this far past the station (schematic)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -333,6 +335,68 @@ def contract_short(edges, min_len=None):
     return out
 
 
+def station_access(edges, stations, geoms, line_of):
+    """Dworzec PKP drawn schematically: buses run down Al. 1000-lecia to the station, some turn back there, the
+    rest go on east to the roundabout. The corridor builder sees one loop through the station carrying every line
+    to the roundabout; it is split where it passes the station into the access leg (all lines, drawn straight
+    through the station) and the through leg (only the lines whose routes use it), which continues straight on
+    STATION_DROP_M m before turning, so the station sits in a straight bundle all lines pass through."""
+    key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
+    by_line = defaultdict(list)
+    for sid, g in geoms.items():
+        by_line[line_of[sid]].append(g)
+    out = [e for e in edges if e["u"] != e["v"] and e["geom"].length >= 1]
+    for name in KEY_STATIONS:
+        sts = [k for k, s in stations.items() if s["name"] == name]
+        if not sts:
+            continue
+        xy = np.mean([stations[k]["xy"] for k in sts], axis=0)
+        cand = [i for i, e in enumerate(out) if e["geom"].distance(Point(xy)) < 200]
+        if not cand:
+            continue
+        i = min(cand, key=lambda i: out[i]["geom"].distance(Point(xy)))
+        e, g = out[i], out[i]["geom"]
+        d = g.project(Point(xy))
+        if d < 50 or d > g.length - 50:
+            continue
+        legs = [LineString([g.interpolate(x) for x in np.linspace(0, d, 40)]),
+                LineString([g.interpolate(x) for x in np.linspace(d, g.length, 80)])]
+        on = []
+        for leg in legs:
+            probe = [leg.interpolate(f, normalized=True) for f in (0.3, 0.5, 0.7)]
+            on.append(frozenset(l for l in e["lines"]
+                                if any(all(sh.distance(p) < TOL for p in probe) for sh in by_line[l])))
+        a = 0 if len(on[0]) >= len(on[1]) else 1          # access leg: the one every line uses
+        acc, thr = legs[a], legs[1 - a]
+        if a == 1:
+            acc = LineString(list(acc.coords)[::-1])        # both legs start at the far ends, meet at the station
+        else:
+            thr = LineString(list(thr.coords)[::-1])
+        acc_c, thr_c = np.array(acc.coords), np.array(thr.coords)  # acc: far end -> station; thr: far end -> station
+        J = acc_c[-1]
+        dv = J - np.array(acc.interpolate(acc.length - min(150, acc.length / 2)).coords[0])
+        dv /= np.hypot(*dv)
+        # through leg: straight on past the station, then its corner (farthest point from the chord) moved as well
+        chord = LineString([thr_c[0], thr_c[-1]])
+        k = int(np.argmax([chord.distance(Point(p)) for p in thr_c]))
+        new_thr = np.vstack([thr_c[:k + 1], [thr_c[k] + dv * STATION_DROP_M, J + dv * STATION_DROP_M, J]])
+        for st in stations.values():                      # stops on the through leg follow it
+            if st["name"] != name and Point(st["xy"]).distance(thr) < 40:
+                st["xy"] = st["xy"] + dv * STATION_DROP_M * 0.5
+        for k_ in sts:                                    # the station: on the access leg, just before the split
+            stations[k_]["xy"] = J - dv * 1.0
+        nodes_ = (e["u"], e["v"]) if a == 0 else (e["v"], e["u"])
+        acc_g = LineString([nodes_[0]] + [tuple(p) for p in acc_c[1:-1]] + [tuple(J)])
+        thr_g = LineString([nodes_[1]] + [tuple(p) for p in new_thr[1:]])
+        all_lines = e["lines"]
+        thr_lines = on[1 - a] or all_lines
+        out[i] = dict(geom=acc_g, lines=all_lines, u=nodes_[0], v=key(J))
+        out.append(dict(geom=thr_g, lines=thr_lines, u=nodes_[1], v=key(J)))
+        print(f"{name}: access leg {sorted(all_lines)} {acc_g.length:.0f} m, "
+              f"through leg {sorted(thr_lines)} {thr_g.length:.0f} m")
+    return out
+
+
 # ---------------------------------------------------------------- 4: line order (per edge)
 def node_passes(edges):
     """For every node: incident edges with their heading away from the node and +1 / -1 (edge leaves / enters)."""
@@ -455,6 +519,61 @@ def lane(orders, i, l):
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING
 
 
+def fillet(c, R):
+    """Every corner of a polyline replaced by a circular arc (tangent length up to half of each leg), as in
+    subway_like_map: a bundle offset from it bends as concentric arcs. Returns the points and, per point, the
+    index of the input segment it belongs to (an arc's first half to the leg before the corner)."""
+    c = np.asarray(c, float)
+    if len(c) < 3:
+        return c, list(range(len(c) - 1)) + [max(len(c) - 2, 0)]
+    seg = np.linalg.norm(np.diff(c, axis=0), axis=1)
+    out, sid = [c[0]], [0]
+    for i in range(1, len(c) - 1):
+        v1 = (c[i - 1] - c[i]) / (seg[i - 1] + 1e-9)
+        v2 = (c[i + 1] - c[i]) / (seg[i] + 1e-9)
+        th = math.pi - math.acos(float(np.clip(np.dot(v1, v2), -1, 1)))      # turning angle
+        if th < math.radians(1) or th > math.radians(179):
+            out.append(c[i])
+            sid.append(i)
+            continue
+        tl = min(R * math.tan(th / 2), seg[i - 1] * 0.5, seg[i] * 0.5)
+        r = tl / math.tan(th / 2)
+        T1, T2 = c[i] + v1 * tl, c[i] + v2 * tl
+        b = (v1 + v2) / (np.linalg.norm(v1 + v2) + 1e-9)
+        C = c[i] + b * math.hypot(r, tl)
+        a1, a2 = math.atan2(*(T1 - C)[::-1]), math.atan2(*(T2 - C)[::-1])
+        da = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+        for f in np.linspace(0, 1, max(3, int(abs(da) / math.radians(5)) + 2)):
+            out.append(C + r * np.array([math.cos(a1 + da * f), math.sin(a1 + da * f)]))
+            sid.append(i - 1 if f < 0.5 else i)
+    out.append(c[-1])
+    sid.append(len(c) - 2)
+    return np.array(out), sid
+
+
+def section_coords(e, width):
+    """An edge's centreline as drawn: simplified (SIMPLIFY_M), then bends inside it that are too tight for the
+    bundle's width (a smaller arc would fold the inner lanes) removed, as subway_like_map does."""
+    c = np.array(e["geom"].simplify(SIMPLIFY_M).coords)
+    rmin = (width - 1) / 2 * SPACING + 0.8 * SPACING
+    while len(c) >= 3:
+        seg = np.linalg.norm(np.diff(c, axis=0), axis=1)
+        worst, wi = 1.0, None
+        for i in range(1, len(c) - 1):
+            v1 = (c[i - 1] - c[i]) / (seg[i - 1] + 1e-9)
+            v2 = (c[i + 1] - c[i]) / (seg[i] + 1e-9)
+            th = math.pi - math.acos(float(np.clip(np.dot(v1, v2), -1, 1)))
+            if th < math.radians(1):
+                continue
+            ratio = rmin * math.tan(th / 2) / (min(seg[i - 1], seg[i]) * 0.5 + 1e-9)
+            if ratio > worst:
+                worst, wi = ratio, i
+        if wi is None:
+            break
+        c = np.delete(c, wi, axis=0)
+    return c
+
+
 def smooth(v, window):
     """Moving average along the first axis (ends held), applied twice: a soft, symmetric kernel."""
     k = max(1, int(round(window / STEP_M)))
@@ -499,34 +618,42 @@ def chain_seqs(l, edges):
     return chains
 
 
+_SECTIONS = {}
+
+
 def draw_path(seq, l, edges, orders):
-    """Drawn coordinates of one chain: the centreline sampled every STEP_M m and smoothed into curves, the lane
-    offset ramped over RAMP_M m wherever it changes, then offset sideways along the smoothed normals."""
-    pts, off = [], []
+    """Drawn coordinates of one chain (subway_like_map style): each section simplified, corners (inside sections
+    and at junctions) replaced by circular arcs of radius CORNER_R, the lane offset eased over RAMP_M m wherever
+    it changes, then applied along the normals, so a bundle bends as concentric arcs."""
+    pts, seg_off = [], []
     for i, fwd in seq:
-        g = edges[i]["geom"].simplify(3)
-        c = np.array(g.coords if fwd else g.coords[::-1])
-        L = LineString(c)
-        ds = np.arange(0, L.length, STEP_M) if L.length > STEP_M else np.array([0.0])
-        q = np.array([L.interpolate(d).coords[0] for d in ds])
+        if i not in _SECTIONS:
+            _SECTIONS[i] = section_coords(edges[i], len(orders[i]))
+        c = _SECTIONS[i] if fwd else _SECTIONS[i][::-1]
         o = lane(orders, i, l) * (1 if fwd else -1)
-        if pts and np.hypot(*(pts[-1] - q[0])) < 0.5:
-            q = q[1:]
-        pts.extend(q)
-        off.extend([o] * len(q))
-    last = seq[-1]
-    g = edges[last[0]]["geom"]
-    pts.append(np.array(g.coords[-1] if last[1] else g.coords[0]))
-    off.append(off[-1])
-    P, O = np.array(pts), np.array(off, dtype=float)
-    if len(P) < 3:
+        if pts:
+            c = c[1:]
+        pts.extend(c)
+        seg_off.extend([o] * len(c))
+    P = np.array(pts)
+    seg_off = np.array(seg_off[1:] if len(seg_off) > 1 else seg_off, dtype=float)  # offset of segment k: P[k]-P[k+1]
+    if len(P) < 2:
         return P
-    P = smooth(P, CURVE_M)
-    O = smooth(O[:, None], RAMP_M)[:, 0]
-    t = np.gradient(P, axis=0)
+    F, sid = fillet(P, CORNER_R)
+    s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
+    keep = np.concatenate([[True], np.diff(s) > 1e-6])
+    F, s, sid = F[keep], s[keep], np.array(sid)[keep]
+    if s[-1] < 1:
+        return F
+    ds = np.append(np.arange(0, s[-1], STEP_M), s[-1])
+    Q = np.column_stack([np.interp(ds, s, F[:, 0]), np.interp(ds, s, F[:, 1])])
+    O = seg_off[np.clip(sid[np.clip(np.searchsorted(s, ds, side="right") - 1, 0, len(sid) - 1)], 0, len(seg_off) - 1)]
+    O = smooth(O[:, None].astype(float), RAMP_M)[:, 0]
+    t = np.gradient(Q, axis=0)
+    t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
     nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
-    return P + nrm * O[:, None]
+    return Q + nrm * O[:, None]
 
 
 def station_spots(stations, edges):
@@ -741,6 +868,7 @@ def main():
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
     edges = contract_short(repair_lines(build_edges(pieces, sets), geoms, line_of))
+    edges = station_access(edges, stations, geoms, line_of)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
     render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out)
