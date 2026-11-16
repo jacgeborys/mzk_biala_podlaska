@@ -54,6 +54,8 @@ RAMP_M = 120        # a line changing lane at a junction eases over this length 
 EXT_SHARE = 0.25    # a line's section with under this share of the trips of its busiest section is an extension (dashed)
 U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
+STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
+ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 170        # ... over which the legs peel apart below the crossing
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
@@ -404,20 +406,24 @@ def station_access(edges, stations):
         C = P0 + dv * (U_DEPTH_M - U_HALF_M)
         Sx = P0 + dv * U_DEPTH_M
         ss = lambda t: t * t * (3 - 2 * t)  # noqa: E731
+        down = u_lines | kos_lines | end_lines
+        st = {-1: len(u_lines) * SPACING / 2, 1: len(down) * SPACING / 2}   # the legs leave side by side
+
         def leg(sign):
-            top = [P0 + dv * (U_TOP_M * t) + sign * perp * U_HALF_M * ss(t) for t in np.linspace(0, 1, 25)]
+            # sideways: first to its place beside the other leg (over 60 m), then on out to U_HALF_M
+            off = lambda t: st[sign] * ss(min(1.0, t * U_TOP_M / 60)) + (U_HALF_M - st[sign]) * ss(t)  # noqa: E731
+            top = [P0 + dv * (U_TOP_M * t) + sign * perp * off(t) for t in np.linspace(0, 1, 35)]
             arc = [C + sign * perp * U_HALF_M * math.cos(a) + dv * U_HALF_M * math.sin(a)
                    for a in np.linspace(0, math.pi / 2, 19)]
             return [tuple(p) for p in top + arc]
-        down = u_lines | kos_lines | end_lines
         keep = [f for k, f in enumerate(out) if k != i]
         lg = leg(-1)
-        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
+        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True, probe_m=U_TOP_M,
                          trips=tr(down)))
         if u_lines:
             rg = leg(1)[::-1]
             keep.append(dict(geom=LineString([tuple(Sx)] + rg[1:-1] + [N2]), lines=u_lines, u=key(Sx), v=N2,
-                             raw=True, trips=tr(u_lines)))
+                             raw=True, probe_m=U_TOP_M, trips=tr(u_lines)))
         if kos_lines:
             kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
             corner = thr_c[kc]
@@ -431,6 +437,27 @@ def station_access(edges, stations):
         for k_ in sts:
             stations[k_]["xy"] = Sx - perp * 1.0                     # on the leg every line uses
         out = keep
+        # how A / C / I pair their four sections at the crossing: the left leg with the arm further west (A: Al.
+        # 1000-lecia north, C, I: Sidorska west), the right leg with the other one. Tried all four ways round: this
+        # one leaves no crossing above the station (14 counted at it, under the bar); C / I the other way: 10 above
+        idx = {id(f): k for k, f in enumerate(out)}
+        left_k = idx[id(next(f for f in out if f.get("raw") and f["u"] == N2))]
+        right_k = next((idx[id(f)] for f in out if f.get("raw") and f["v"] == N2), None)
+
+        def east(k):
+            g_ = out[k]["geom"]
+            d_ = min(60, g_.length / 2)
+            q = g_.interpolate(d_ if out[k]["u"] == N2 else g_.length - d_)
+            return float(np.dot(np.array(q.coords[0]) - P0, perp))
+        for l in u_lines:
+            arms = [k for k, f in enumerate(out) if l in f["lines"] and N2 in (f["u"], f["v"])
+                    and k not in (left_k, right_k)]
+            if len(arms) != 2 or right_k is None:
+                continue
+            w_arm, e_arm = sorted(arms, key=east)
+            PAIRS[(l, N2)] = {left_k: w_arm, w_arm: left_k, right_k: e_arm, e_arm: right_k}
+        NODE_W[key(Sx)] = STATION_CROSS_W
+        NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
               f"{sorted(end_lines)}")
     return out
@@ -442,7 +469,12 @@ def node_passes(edges):
     nodes = defaultdict(list)
     for i, e in enumerate(edges):
         g = e["geom"]
-        k = min(25, g.length / 2)
+        k = min(e.get("probe_m", 25), g.length / 2)        # the U's legs: measured where they have peeled apart
+        if "probe_m" in e:
+            pu, pv, qu, qv = g.interpolate(0), g.interpolate(g.length), g.interpolate(k), g.interpolate(g.length - k)
+            nodes[e["u"]].append((i, math.atan2(qu.y - pu.y, qu.x - pu.x), +1))
+            nodes[e["v"]].append((i, math.atan2(qv.y - pv.y, qv.x - pv.x), -1))
+            continue
         nodes[e["u"]].append((i, heading_at(g, k), +1))
         nodes[e["v"]].append((i, heading_at(g, g.length - k) + math.pi, -1))
     return nodes
@@ -459,42 +491,57 @@ def turn(h_from_entry, h_out):
     return (h_out - h_from_entry + math.pi) % (2 * math.pi) - math.pi
 
 
-def node_cost(inc, orders, edges):
-    """Crossings at one node (pairs of lines whose left/right order is wrong) + SHIFT_COST per lane shifted."""
+def node_cost(inc, orders, edges, node=None):
+    """Crossings at one node (pairs of passes whose left/right order is wrong) + SHIFT_COST per lane shifted,
+    times the node's weight (NODE_W).
+    A pass is a line going through the node from one section to another: a line with two sections here, or the
+    pairs set in PAIRS (the Dworzec PKP U). Lines touching a node 3+ times otherwise (terminal loops) are left
+    out: every order "crosses" somewhere there, which would drown the real junctions."""
     per_line = defaultdict(dict)
     for i, h, sgn in inc:
         for l in orders[i]:
             per_line[l][i] = (h, sgn)
-    cost = 0.0
-    ls = list(per_line)
-    for a in ls:                                         # lane shifts of a line passing straight through
-        ea = per_line[a]
+    passes = []
+    for l, ea in per_line.items():
         if len(ea) == 2:
-            (p, (hp, sp)), (q, (hq, sq)) = ea.items()
-            cost += SHIFT_COST * abs(-left_of(orders, p, a, sp) - left_of(orders, q, a, sq))
-    # pairs only among lines passing through once (two edges here): at terminal loops a line touches the node
-    # three times and every order "crosses" somewhere, which would drown the real junctions
-    ls = [l for l in ls if len(per_line[l]) == 2]
-    for x in range(len(ls)):
-        for y in range(x + 1, len(ls)):
-            a, b = ls[x], ls[y]
+            passes.append((l, *ea))
+        elif (l, node) in PAIRS:
+            pr = PAIRS[(l, node)]
+            passes += [(l, p, q) for p, q in pr.items() if p < q and p in ea and q in ea]
+    cost = 0.0
+    for a, p, q in passes:                               # lane shifts of a line passing through
+        ea = per_line[a]
+        cost += SHIFT_COST * abs(-left_of(orders, p, a, ea[p][1]) - left_of(orders, q, a, ea[q][1]))
+    crossings = 0
+    for x in range(len(passes)):
+        for y in range(x + 1, len(passes)):
+            a, pa, qa_ = passes[x]
+            b, pb, qb_ = passes[y]
+            if a == b:
+                continue
             ea, eb = per_line[a], per_line[b]
-            for p in set(ea) & set(eb):
+            if not {pa, qa_} & {pb, qb_}:                 # no section shared: cross if their ends interleave
+                ang = lambda e_, ed: ed[e_][0] % (2 * math.pi)  # noqa: E731
+                a0, a1 = sorted((ang(pa, ea), ang(qa_, ea)))
+                inside = [a0 < ang(e_, eb) < a1 for e_ in (pb, qb_)]
+                if inside[0] != inside[1]:
+                    crossings += 1
+                continue
+            for p in {pa, qa_} & {pb, qb_}:
+                qa = qa_ if p == pa else pa
+                qb = qb_ if p == pb else pb
                 hp, sp = ea[p]
                 entry = hp + math.pi                     # direction of travel into the node along p
                 la, lb = -left_of(orders, p, a, sp), -left_of(orders, p, b, sp)
-                for qa, (ha, sa) in ea.items():
-                    for qb, (hb, sb) in eb.items():
-                        if qa == p or qb == p:
-                            continue
-                        if qa == qb:                     # on together: left/right must stay
-                            if (la > lb) != (left_of(orders, qa, a, sa) > left_of(orders, qa, b, sb)):
-                                cost += 1
-                        else:                            # split: the line turning further left keeps left
-                            ta, tb = turn(entry, ha), turn(entry, hb)
-                            if abs(ta - tb) > 0.05 and (la > lb) != (ta > tb):
-                                cost += 1
-    return cost
+                (ha, sa), (hb, sb) = ea[qa], eb[qb]
+                if qa == qb:                             # on together: left/right must stay
+                    if (la > lb) != (left_of(orders, qa, a, sa) > left_of(orders, qa, b, sb)):
+                        crossings += 1
+                else:                                    # split: the line turning further left keeps left
+                    ta, tb = turn(entry, ha), turn(entry, hb)
+                    if abs(ta - tb) > 0.05 and (la > lb) != (ta > tb):
+                        crossings += 1
+    return (cost + crossings) * NODE_W.get(node, 1.0)
 
 
 def global_start(lines, edges, nodes, seed, iters=3000):
@@ -505,7 +552,7 @@ def global_start(lines, edges, nodes, seed, iters=3000):
         return [sorted(e["lines"], key=rank.get) for e in edges]
     def total(order):
         o = orders_for(order)
-        return sum(node_cost(inc, o, edges) for inc in nodes.values())
+        return sum(node_cost(inc, o, edges, n) for n, inc in nodes.items())
     cur = sorted(lines)
     cur_c = total(cur)
     best, best_c = cur[:], cur_c
@@ -528,7 +575,7 @@ def best_orders(lines, edges, seed, iters=60000):
     nodes = node_passes(edges)
     orders, start_c = global_start(lines, edges, nodes, seed)
     ends = [(e["u"], e["v"]) for e in edges]
-    cost_at = {n: node_cost(inc, orders, edges) for n, inc in nodes.items()}
+    cost_at = {n: node_cost(inc, orders, edges, n) for n, inc in nodes.items()}
     multi = [i for i, o in enumerate(orders) if len(o) > 1]
     rnd = random.Random(seed + 7)
     cur_total = sum(cost_at.values())
@@ -538,7 +585,7 @@ def best_orders(lines, edges, seed, iters=60000):
         a_, b_ = rnd.sample(range(len(orders[i])), 2)
         orders[i][a_], orders[i][b_] = orders[i][b_], orders[i][a_]
         touched = set(ends[i])
-        new = {n: node_cost(nodes[n], orders, edges) for n in touched}
+        new = {n: node_cost(nodes[n], orders, edges, n) for n in touched}
         delta = sum(new[n] - cost_at[n] for n in touched)
         T = 1.0 * (1 - it / iters) + 1e-3
         if delta <= 0 or rnd.random() < math.exp(-delta / T):
@@ -647,9 +694,13 @@ def chain_seqs(l, edges):
             seq.append((i, fwd))
             node = e["v"] if fwd else e["u"]
             nxt = [j for j in inc[node] if j != i and j not in used]
-            i = nxt[0] if len(inc[node]) == 2 and nxt else None
+            pr = PAIRS.get((l, node), {})
+            if i in pr:
+                i = pr[i] if pr[i] not in used else None
+            else:
+                i = nxt[0] if len(inc[node]) == 2 and nxt else None
         return seq
-    for n in [n for n, es in inc.items() if len(es) != 2]:
+    for n in [n for n, es in inc.items() if len(es) != 2 and not set(es) <= set(PAIRS.get((l, n), {}))]:
         for i in inc[n]:
             if i not in used:
                 chains.append(walk(n, i))
@@ -671,6 +722,9 @@ def lead_in(l, node, i, edges, inc_l, before):
     others = [j for j in inc_l[(l, node)] if j != i]
     if not others:
         return None
+    if i in PAIRS.get((l, node), {}):
+        j = PAIRS[(l, node)][i]
+        return (j, edges[j]["v"] == node) if before else (j, edges[j]["u"] == node)
 
     def away(j):
         g = edges[j]["geom"]
@@ -681,6 +735,8 @@ def lead_in(l, node, i, edges, inc_l, before):
 
 
 _SECTIONS = {}
+PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
+NODE_W = {}     # node -> weight of crossings there (crossings under the station bar are cheap)
 
 
 def draw_path(seq, l, edges, orders):
