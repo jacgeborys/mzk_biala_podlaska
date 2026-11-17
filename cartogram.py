@@ -544,8 +544,7 @@ def draw(edges, n_trips, date, frame, out, limits=None):
     ax.text(x2, 0.972, "Ile autobusów MZK przejeżdża ulicą w ciągu doby?", transform=ax.transAxes,
             ha="left", va="top", fontproperties=bahn(title_pt), color=INK, path_effects=halo, zorder=10)
     d = pd.Timestamp(date)
-    ax.text(x2, bb.y0 + 0.004, f"dzień powszedni · {DAY_NAMES[d.weekday()]} {d:%d.%m.%Y} · {n_trips} kursów, "
-            "oba kierunki", transform=ax.transAxes, ha="left", va="bottom", fontproperties=bahn(sub_pt),
+    ax.text(x2, bb.y0 + 0.004, f"dzień powszedni · {DAY_NAMES[d.weekday()]} {d:%d.%m.%Y} · oba kierunki", transform=ax.transAxes, ha="left", va="bottom", fontproperties=bahn(sub_pt),
             color=INK_DIM, path_effects=halo, zorder=10)
 
     # legend box, bottom right
