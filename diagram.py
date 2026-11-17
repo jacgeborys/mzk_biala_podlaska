@@ -64,6 +64,7 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
+CORNER_EASE = 0.4   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
 TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
@@ -1083,8 +1084,16 @@ def relax_junction_corners(edges, orders):
                         w1, w2 = c_[v] - c_[v - 1], c_[v + 1] - c_[v]
                         cv = np.dot(w1, w2) / (np.hypot(*w1) * np.hypot(*w2) + 1e-9)
                         if cv < math.cos(math.radians(45)) and np.hypot(*(c_[v] - c_[-1])) > 250:
-                            continue          # ... unless it is a real street corner away from the junction (G onto
-                            #                   al. Jana Pawła II, 420 m on); corners right at a junction may go
+                            # ... unless it is a real street corner away from the junction (G onto al. Jana Pawła II,
+                            # 456 m on): that one is only eased, pulled CORNER_EASE of the way towards the chord of its
+                            # neighbours, once
+                            if not e_.get("eased"):
+                                c2 = c_.copy()
+                                c2[v] = c_[v] + CORNER_EASE * ((c_[v - 1] + c_[v + 1]) / 2 - c_[v])
+                                _SECTIONS[k] = c2 if np.array_equal(c_[0], _SECTIONS[k][0]) else c2[::-1]
+                                e_["eased"] = True
+                                changed = True
+                            continue
                         c2 = np.delete(c_, v, axis=0)
                         _SECTIONS[k] = c2 if np.array_equal(c_[0], _SECTIONS[k][0]) else c2[::-1]
                         dropped += 1
@@ -1239,6 +1248,7 @@ STREET_LABELS = {
     "Podleśna": "Podleśna", "Lubelska": "Lubelska",
 }
 STREET_SIZE, STREET_COLOR = 10.5, "#8e8e8e"
+STREET_NEAR_CENTRE = {"Sidorska", "Francuska"}
 
 
 def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
@@ -1280,13 +1290,18 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
             cands[names[keep[k]]].append((i, np.array(p.coords[0]), t, half, dd, sec.length))
     m = m_per_pt
     n_done = 0
+    centre = np.mean([np.array(e["geom"].interpolate(0.5, normalized=True).coords[0]) * len(e["lines"])
+                      for e in edges], axis=0) / np.mean([len(e["lines"]) for e in edges])
     for street, cs in sorted(cands.items(), key=lambda kv: -len(kv[1])):
         text = STREET_LABELS[street]
         w = len(text) * STREET_SIZE * 0.55 * m
         h = STREET_SIZE * 1.15 * m
         # spots nearest the middle of the street's longest section first; the preferred side (below a horizontal
         # street, right of a vertical one) anywhere along the street before the other side
-        cs = sorted(cs, key=lambda c_: (-c_[5], abs(c_[4] - c_[5] / 2)))
+        if street in STREET_NEAR_CENTRE:               # long radial streets: named close to the city
+            cs = sorted(cs, key=lambda c_: np.hypot(*(c_[1] - centre)))
+        else:
+            cs = sorted(cs, key=lambda c_: (-c_[5], abs(c_[4] - c_[5] / 2)))
         done = False
         for pref in (True, False):
           for i, p, t, half, _, _ in cs:  # noqa: E111
@@ -1468,36 +1483,53 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 continue
             chains.append((l, seq, pre, post, c, E, Q))
 
-    # a line ending at a terminus that comes in beside the bundle instead of along it (C at Terebelska Pętla from
-    # Jana III Sobieskiego, curving north just past the trunk's end): the station line (straight across the road,
-    # so every line ending there stops at the same height) is moved along the road to the peak of that line's arc
-    # (where its curve runs parallel to the station line), and the capsule reaches out to it there
+    # a line ending at a terminus that curves in beside the bundle instead of along it (C at Terebelska Pętla from
+    # Jana III Sobieskiego, curving north past the trunk's end): the station line stays square across the road and
+    # is slid along it to where that line's curve runs exactly one lane outside the outermost line ending there on
+    # its side (C next to G), so the capsule reaches out to it as one bar
+    def crossings(c, b0, t_):
+        """Positions across the road (along nrm) where the drawn polyline c crosses the line through b0 square to t_."""
+        n_ = np.array([-t_[1], t_[0]])
+        sv = (c - b0) @ t_
+        out = []
+        for j in range(1, len(c)):
+            if sv[j - 1] == 0 or np.sign(sv[j - 1]) != np.sign(sv[j]):
+                f = sv[j - 1] / (sv[j - 1] - sv[j]) if sv[j - 1] != sv[j] else 0
+                q = c[j - 1] + (c[j] - c[j - 1]) * f
+                out.append((float((q - b0) @ n_), q))
+        return out
+
     for k, (i, base, t, _) in spots.items():
         extra = stations[k]["term"] - edges[i]["lines"]
-        if not extra:
+        ending = stations[k]["term"] & edges[i]["lines"]
+        if not extra or not ending:
             continue
-        node = min((edges[i]["u"], edges[i]["v"]), key=lambda n: np.hypot(*(np.array(n) - base)))
+        nrm_ = np.array([-t[1], t[0]])
         best = None
-        for l, _, _, _, c, _, _ in chains:
-            if l not in extra:
+        for s_ in np.arange(-150, 151, 2.0):
+            b0 = base + t * s_
+            hit = {l: x for l, _, _, _, c, _, _ in chains if l in ending
+                   for x, _ in crossings(c, b0, t) if abs(x) < 4 * SPACING + 60}
+            if set(hit) != ending:                                 # every line ending there must reach it
                 continue
-            dd = np.hypot(*(c - np.array(node)).T)
-            near = np.where(dd < 3 * SPACING + 80)[0]
-            if not len(near):
-                continue
-            # the peak of its arc: the lowest point (on the page) of its bend round the junction; only where the
-            # line curves through (C at Terebelska Pętla), not where it simply ends (D at Al. Solidarności 3)
-            j = int(near[np.argmin(c[near, 1])])
-            sdj = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(c, axis=0).T))])
-            if sdj[j] < 40 or sdj[-1] - sdj[j] < 40 or j in (near.min(), near.max()):
-                continue                                         # a real dip: the line rises again either side
-            if best is None or dd[j] < best[0]:
-                best = (dd[j], c[j])
-        if best is not None:
-            apex = best[1]
-            # the station line: level on the page through the peak, so the lines ending there stop at one height
-            t_lvl = np.array([0.0, 1.0]) if t[1] >= 0 else np.array([0.0, -1.0])
-            shifted[k] = (apex.copy(), apex, t_lvl)
+            ends_x = list(hit.values())
+            for l, _, _, _, c, _, _ in chains:
+                if l not in extra:
+                    continue
+                for x, q in crossings(c, b0, t):
+                    if abs(x) > 6 * SPACING + 80:
+                        continue
+                    if x > max(ends_x):                            # outside the bundle on the + side
+                        gap = x - max(ends_x)
+                    elif x < min(ends_x):
+                        gap = min(ends_x) - x
+                    else:
+                        continue
+                    sc = abs(gap - SPACING) + 0.05 * abs(s_)
+                    if best is None or sc < best[0]:
+                        best = (sc, b0, q)
+        if best is not None and best[0] < SPACING:
+            shifted[k] = (best[1], best[2], t)
 
     tilted = {}
     for _ in [0]:
