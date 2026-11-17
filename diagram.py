@@ -2739,6 +2739,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         main = st_["term"]                           # real termini only (B only visits Dworzec PKP, in and out)
         main = main - var_end.get(sid, set())        # a line ending here on a pale extension: diamond
         bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()))]
+        if key_st:                                   # lines calling without ending there: squares
+            bullets += [(l, "s") for l in sorted(st_["lines"] - main - var_end.get(sid, set()))
+                        if st_["trips"].get(l, 0) >= EXT_SHARE * line_trips[l]]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
     def bullet_w(bullets, trips):
@@ -2892,7 +2895,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         for l, mk in bullets:  # lines ending here: bullets under the name (diamond: variant, with its trips a day)
             bx = bx0 + (xo + 7) * m_per_pt
             by = ty - (size * 0.62 + 9) * m_per_pt
-            ax.scatter([bx], [by], marker=mk, s=(13 if mk == "o" else 11.5) ** 2, color=colors.get(l, "#888"),
+            ax.scatter([bx], [by], marker=mk, s=(13 if mk == "o" else 11.5 if mk == "D" else 11) ** 2, color=colors.get(l, "#888"),
                        zorder=7, linewidths=0)
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
             xo += 15
@@ -2945,12 +2948,18 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
     key_rows = [("dot", "przystanek"), ("arrow", "przystanek w jednym kierunku jazdy"),
                 ("dash", "wydłużenia: mniej niż połowa kursów linii"),
-                ("diamond", "koniec wydłużenia, obok: kursów linii na dobę")]
+                ("diamond", "koniec wydłużenia, obok: kursów linii na dobę"),
+                ("square", "linia przejeżdża przez węzeł (nie kończy biegu)")]
     kl = lw * 2.2                                   # key drawn larger than on the map, to be legible
     for k, (kind, text) in enumerate(key_rows):
         y = ky - k * row * 0.68
         xm = (kx0 + kx1) / 2
-        if kind == "diamond":
+        if kind == "square":
+            ax.scatter([xm - (kx1 - kx0) * 0.18], [y], marker="s", s=19 ** 2, color="#8a8a8a", zorder=9.5,
+                       linewidths=0)
+            ax.text(xm - (kx1 - kx0) * 0.18, y, "A", fontproperties=font(12), color="white", ha="center",
+                    va="center", zorder=9.6)
+        elif kind == "diamond":
             ax.scatter([xm - (kx1 - kx0) * 0.18], [y], marker="D", s=21 ** 2, color="#8a8a8a", zorder=9.5,
                        linewidths=0)
             ax.text(xm - (kx1 - kx0) * 0.18, y, "E", fontproperties=font(12), color="white", ha="center",
