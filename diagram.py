@@ -61,6 +61,7 @@ EXT_SHARE = 0.5     # where a line runs with under this share of its trips of th
 # Dworzec PKP: the U hangs below the Sidorska / Al. 1000-lecia crossing as deep as its parts need
 # (U_TOP_M + S-bend + U_HALF_M, 582 m; was 690 with a 285-300 m straight top)
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
+STATION_STYLE = "u"     # Dworzec PKP: u / untangle / under / spur / box (--station; see station_access)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 260        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
@@ -784,29 +785,90 @@ def station_access(edges, stations):
             return [tuple(p) for p in [P0, P0 + dv * U_TOP_M] + ease_p + arc], prof
         keep = [f for k, f in enumerate(out) if k != i]
         nL, nR = len(down), len(u_lines)
+        if STATION_STYLE == "spur":
+            # a short dead-end spur, as in reality: both legs straight down side by side (west: all lines in, the
+            # lines going on along Kościuszki outermost; east: the lines coming back up), each line turning back on
+            # a nested hairpin round one point on the boundary between the legs (innermost lane: half a lane
+            # radius); the lines to Kościuszki go round the outside of the hairpins and on east. Centrelines run
+            # RHO either side of the boundary (a jog of RHO at the top), the lanes put in place by shift_prof.
+            RHO = SPACING / 2
+            O_ = P0 + dv * U_TOP_M                                       # hairpin centre, on the boundary
+            Sx = O_ + dv * RHO
+            C = O_
+            jog = 60.0
+
+            def spur_leg(sign):
+                top = [P0, P0 + dv * jog + sign * perp * RHO]
+                straight = [O_ + sign * perp * RHO]
+                arc = [O_ + sign * perp * RHO * math.cos(a) + dv * RHO * math.sin(a)
+                       for a in np.linspace(0, math.pi / 2, 7)[1:]]
+                return [tuple(p) for p in top + straight + arc]
+            lg = spur_leg(-1)
+            sh_top_L = -nL * SPACING / 2                  # left of travel (down: east +): lanes west of the boundary
+            lprof = [sh_top_L] + [sh_top_L + RHO] * (len(lg) - 1)
+            keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
+                             twin_side=-1, trips=tr(down), shift_prof=lprof, schematic=Point(xy), down_dir=dv))
+            if u_lines:
+                rg = spur_leg(1)
+                sh_top_R = -nR * SPACING / 2              # left of travel (up: west +): lanes east of the boundary
+                rprof = [sh_top_R] + [sh_top_R + RHO] * (len(rg) - 1)
+                keep.append(dict(geom=LineString([tuple(Sx)] + rg[::-1][1:-1] + [N2]), lines=u_lines, u=key(Sx),
+                                 v=N2, raw=True, twin_side=-1, trips=tr(u_lines), shift_prof=rprof[::-1],
+                                 schematic=Point(xy), down_dir=dv))
+            if kos_lines:
+                kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
+                corner = thr_c[kc]
+                turn = Sx + perp * max(float(np.dot(corner - Sx, perp)), 250.0)
+                kg = [tuple(Sx), tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1]
+                kg = [tuple(Sx)] + list(LineString(kg[1:]).simplify(SIMPLIFY_M).coords)   # drawn as is (raw)
+                # outside the hairpins: the outermost (u_lines) lanes reach (nL - 0.5) lanes below the centre
+                ksh = -(len(u_lines) + len(kos_lines) / 2) * SPACING + RHO
+                keep.append(dict(geom=LineString(kg), lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines), raw=True,
+                                 shift_prof=[ksh, ksh] + [0.0] * (len(kg) - 2),
+                                 schematic=LineString(thr_c).interpolate(0.5, normalized=True)))
+                kos_g = keep[-1]["geom"]
+                for st in stations.values():
+                    if st["name"] != name and Point(st["xy"]).distance(LineString(thr_c)) < 40:
+                        st["xy"] = np.array(kos_g.interpolate(kos_g.project(Point(st["xy"]))).coords[0])
+            for k_ in sts:
+                stations[k_]["xy"] = Sx + dv * 1.0
+            U_INFO.update(spur=True)
+        else:
+            Sx = None
         # shift: metres left of the edge's direction (left leg: down, so west is negative; right leg: up, so east
         # is negative)
-        lg, lprof = leg(-1, -nR * SPACING / 2)
+        lg, lprof = leg(-1, -nR * SPACING / 2) if Sx is None else (None, None)
         probe = U_TOP_M + s_len                                   # headings measured where the legs are apart
-        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
-                         probe_m=probe, trips=tr(down), shift_prof=lprof, schematic=Point(xy)))
-        if u_lines:
+        Sx = P0 + dv * depth if Sx is None else Sx
+        spur = STATION_STYLE == "spur"
+        if not spur:
+            keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
+                             probe_m=probe, trips=tr(down), shift_prof=lprof, schematic=Point(xy)))
+        if u_lines and not spur:
             rg, rprof = leg(1, -nL * SPACING / 2)
             keep.append(dict(geom=LineString([tuple(Sx)] + rg[::-1][1:-1] + [N2]), lines=u_lines, u=key(Sx), v=N2,
                              raw=True, probe_m=probe, trips=tr(u_lines), shift_prof=rprof[::-1], schematic=Point(xy)))
-        if kos_lines:
+        if kos_lines and not spur:
             kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
             corner = thr_c[kc]
             turn = Sx + perp * max(float(np.dot(corner - Sx, perp)), U_HALF_M + 200)  # east along the bottom, then up
-            keep.append(dict(geom=LineString([tuple(Sx), tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1]),
-                             lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines),
-                             schematic=LineString(thr_c).interpolate(0.5, normalized=True)))
+            kg = [tuple(Sx), tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1]
+            kd = dict(lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines),
+                      schematic=LineString(thr_c).interpolate(0.5, normalized=True))
+            if STATION_STYLE in ("untangle", "under"):
+                # no crossings at the station: these lines are the outermost lanes of the west leg's bottom, so
+                # they leave on those lanes (shifted south by the U lines' half width), drawn as is
+                kg = [tuple(Sx)] + list(LineString(kg[1:]).simplify(SIMPLIFY_M).coords)
+                ksh = -(len(down) - len(kos_lines)) / 2 * SPACING
+                kd.update(raw=True, shift_prof=[ksh, ksh] + [0.0] * (len(kg) - 2))
+            keep.append(dict(geom=LineString(kg), **kd))
             kos_g = keep[-1]["geom"]
             for st in stations.values():                              # stops on Kościuszki follow it
                 if st["name"] != name and Point(st["xy"]).distance(LineString(thr_c)) < 40:
                     st["xy"] = np.array(kos_g.interpolate(kos_g.project(Point(st["xy"]))).coords[0])
-        for k_ in sts:
-            stations[k_]["xy"] = Sx - perp * 1.0                     # on the leg every line uses
+        if not spur:
+            for k_ in sts:
+                stations[k_]["xy"] = Sx - perp * 1.0                 # on the leg every line uses
         out = keep
         # how A / C / I pair their four sections at the crossing: by side, the more westerly arm with the west leg,
         # the other with the east leg, so no line crosses itself there (C, I: Sidorska west + west leg, Al.
@@ -855,7 +917,7 @@ def station_access(edges, stations):
                     f["split_at"] = (N2, U_TOP_M)
                 else:                 # too short to shift back before the next junction (A on Sidorska east,
                     f["shift_all"] = True       # 445 m): shifted all along, so A runs straight between two arcs
-        U_INFO.update(node=N2, left=left_k, right=right_k)
+        U_INFO.update(node=N2, left=left_k, right=right_k, dv=dv, perp=perp, Sx=np.array(Sx), name=name)
         NODE_W[key(Sx)] = STATION_CROSS_W
         NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
@@ -1901,7 +1963,7 @@ def u_turns(seq, l, edges, orders, c, E, Q):
             # the leg's lane, exactly: its straight top (U_TOP_M from the crossing), line l's lane on it
             gl = np.array(edges[leg]["geom"].coords)
             down_u = edges[leg]["u"] == N2                         # left leg: drawn from the crossing down
-            d2 = (gl[1] - gl[0]) if down_u else (gl[-2] - gl[-1])
+            d2 = edges[leg]["down_dir"] if "down_dir" in edges[leg] else                 ((gl[1] - gl[0]) if down_u else (gl[-2] - gl[-1]))
             d2 = d2 / np.hypot(*d2)
             pr_ = edges[leg]["shift_prof"]
             b_ = (lane(orders, leg, l) + pr_[0]) if down_u else -(lane(orders, leg, l) + pr_[-1])
@@ -2402,6 +2464,37 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                     d = c[k] - c[k2]
                     line_ends.append((l, c[k], d / max(np.hypot(*d), 1e-9), trimmed.get(end_i)))
 
+    # Dworzec PKP drawn as a box over the bottom of the U (box) or as a platform under it (under)
+    station_shape = None
+    if U_INFO and STATION_STYLE in ("box", "under"):
+        N2_, dv_, pp_ = np.array(U_INFO["node"]), U_INFO["dv"], U_INFO["perp"]
+        legs_ = (U_INFO["left"], U_INFO["right"])
+        depth_ = float((U_INFO["Sx"] - N2_) @ dv_)
+        cut_ = U_TOP_M + 30 if STATION_STYLE == "box" else depth_ - U_HALF_M * 1.1
+        pts_ = [p for _, _, _, _, c, E_, _ in chains for p, e_ in zip(c, E_)
+                if e_ in legs_ and (p - N2_) @ dv_ > cut_]
+        if pts_:
+            loc = np.array([[(p - N2_) @ pp_, (p - N2_) @ dv_] for p in pts_])
+            pad = SPACING * 0.9
+            (a0, b0), (a1, b1) = loc.min(axis=0) - pad, loc.max(axis=0) + pad
+            to_map = lambda u_, w_: N2_ + pp_ * u_ + dv_ * w_  # noqa: E731
+            if STATION_STYLE == "box":
+                r_ = 60.0
+                shp = box(a0 + r_, b0 + r_, a1 - r_, b1 - r_).buffer(r_, quad_segs=12)
+            else:
+                h_ = (b1 - b0) / 2
+                shp = LineString([(a0 + h_, (b0 + b1) / 2), (a1 - h_, (b0 + b1) / 2)]).buffer(h_, quad_segs=16)
+            ring = np.array([to_map(u_, w_) for u_, w_ in shp.exterior.coords])
+            z_ = 5.5 if STATION_STYLE == "box" else 2.5
+            ax.add_patch(plt.Polygon(ring, closed=True, facecolor="white", edgecolor=INK, linewidth=lw * 0.45,
+                                     zorder=z_))
+            station_shape = Polygon(ring)
+            drawn.append(station_shape)
+            if STATION_STYLE == "box":
+                cen = np.array(station_shape.centroid.coords[0])
+                ax.text(cen[0], cen[1], "Dworzec" + chr(10) + "PKP", fontproperties=font(9.5), color=INK,
+                        ha="center", va="center", zorder=5.6, linespacing=1.05)
+
     # stops, interchanges, labels (one name per stop name without the post number)
     halo = [patheffects.withStroke(linewidth=4, foreground=LAND)]
     m_per_pt = 1 / pt_per_m
@@ -2517,6 +2610,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             far += SPACING * 0.55 * (1 if far > sa else -1)
             a_, b_ = b2 + nrm * far, b2 + nrm * sa
             base = b2
+        if key_st and station_shape is not None:     # Dworzec PKP as a box / platform (drawn above)
+            if STATION_STYLE == "box":
+                continue
+            requests.append((0, -len(st_["lines"]), sid, base, station_shape.buffer(5), []))
+            continue
         far_stop = np.hypot(*(st_["xy"] - base)) > 90           # placed by the fallback: the diamond marks it
         if not far_stop and not any(n_ == base_name(st_["name"]) and np.hypot(*(q_ - base)) < 150
                                     for n_, q_ in capsuled):
@@ -2769,9 +2867,15 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--ext-style", choices=["dashed", "thin", "pale", "hollow"], default=None)
+    ap.add_argument("--station", choices=["u", "untangle", "under", "spur", "box"], default=None)
     args = ap.parse_args()
-    global EXT_STYLE
+    global EXT_STYLE, STATION_STYLE, STATION_CROSS_W, ABOVE_CROSS_W, U_TOP_M, U_S_R, U_HALF_M
     EXT_STYLE = args.ext_style or EXT_STYLE
+    STATION_STYLE = args.station or STATION_STYLE
+    if STATION_STYLE in ("untangle", "under", "spur"):   # no crossings at the station: they go to the junction
+        STATION_CROSS_W, ABOVE_CROSS_W = 5.0, 1.0
+    if STATION_STYLE == "box":                           # a compact U, its bottom hidden in the station box
+        U_TOP_M, U_S_R, U_HALF_M = 200, 120, 90
     geoms, n_shape, line_of, stations, line_trips = load(args.date)
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
