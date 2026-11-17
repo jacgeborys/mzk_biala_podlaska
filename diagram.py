@@ -72,6 +72,7 @@ CONNECT_M = 500     # a line broken into pieces is joined along the corridors if
 DROP_M = 150        # pieces of a line shorter than this that cannot be joined are dropped (strays)
 END_JOIN_M = 400    # a loose end of a line inside the network continues this far at most to reach the line again
 PAIR_M = 80         # two loose ends of one line this close are bridged
+LEAD_FOLLOW_M = 120  # a line's continuation at a junction: its routes are followed this far past the node
 SNAP_M = 10         # corridor ends this close are linked before lines are repaired (gaps closed in place)
 RB_MARGIN_M = 10    # roundabouts: edges cut this far outside the ring and joined straight to one node
 STUB_M = 150        # dead-end bits of a line this short that do not end where its routes end are dropped
@@ -877,11 +878,37 @@ def chain_node(step, edges, start):
     return (e["u"] if fwd else e["v"]) if start else (e["v"] if fwd else e["u"])
 
 
+def continuations(node, i, others, edges, shapes):
+    """Trips (of the given shapes) running from / to section i through node on to each of the sections `others`
+    (see lead_in): {section: trips}."""
+    g_i = edges[i]["geom"]
+    d = min(40.0, g_i.length / 2)
+    qi = g_i.interpolate(d if edges[i]["u"] == node else g_i.length - d)
+    score = {}
+    for g, n in shapes:
+        if g.distance(qi) >= EXT_TOL:
+            continue
+        p, pn = g.project(qi), g.project(Point(node))
+        if g.interpolate(pn).distance(Point(node)) > EXT_TOL:
+            continue
+        pt = g.interpolate(pn + (LEAD_FOLLOW_M if pn > p else -LEAD_FOLLOW_M))
+        dist = {j: edges[j]["geom"].distance(pt) for j in others}
+        j = min(dist, key=dist.get)
+        if dist[j] < EXT_TOL and dist[j] < g_i.distance(pt):
+            score[j] = score.get(j, 0) + n
+    return score
+
+
 def lead_in(l, node, i, edges, inc_l, before, shapes=()):
     """Line l's continuation through node from section i, as a chain step (None if l ends there): the section its
-    buses really drive on to / come from (shapes passing both within 40 m of the node, one right after the other,
-    weighted by trips; e.g. E from Daleka north into Wolska, not the straighter Daleka south), else the
-    straightest."""
+    buses really drive on to / come from, else the straightest. Every shape of the line running along section i
+    (within EXT_TOL of a point 40 m out) is followed to where it passes the node and LEAD_FOLLOW_M beyond it (on
+    the far side from i); the other section of the line it is nearest to there gets the shape's trips (measured
+    from the node, not from the point on i: near a straightened roundabout that left K's Białka -> cemetery
+    route landing on Al. Solidarności). Nearest, not "within a
+    tolerance": next to a merged junction a route can run within 31 m of an arm it does not take (H at Sidorska /
+    Al. Solidarności), and a tolerance either ties there or misses the routes elsewhere (L at Francuska).
+    E.g. E from Daleka north into Wolska, H from Al. Solidarności west along Sidorska, L north to Francuska."""
     others = [j for j in inc_l[(l, node)] if j != i]
     if not others:
         return None
@@ -892,17 +919,7 @@ def lead_in(l, node, i, edges, inc_l, before, shapes=()):
     def away(j):
         g = edges[j]["geom"]
         return heading_at(g, 0) if edges[j]["u"] == node else heading_at(g, g.length) + math.pi
-    def near(j):
-        g = edges[j]["geom"]
-        d = min(40.0, g.length / 2)
-        return g.interpolate(d if edges[j]["u"] == node else g.length - d)
-    qi = near(i)
-    score = {}
-    for j in others:
-        qj = near(j)
-        for g, n in shapes:
-            if g.distance(qi) < TOL and g.distance(qj) < TOL and abs(g.project(qi) - g.project(qj)) < 200:
-                score[j] = score.get(j, 0) + n
+    score = continuations(node, i, others, edges, shapes)
     h = away(i)
     straight = lambda j: abs((away(j) - h - math.pi + math.pi) % (2 * math.pi) - math.pi)  # noqa: E731
     j = min(others, key=lambda j: (-score.get(j, 0), straight(j)))
@@ -1085,6 +1102,28 @@ def station_spots(stations, edges):
 
 
 # ---------------------------------------------------------------- render
+EXT_STYLE = "pale"     # how extensions are drawn: dashed / thin / pale / hollow (--ext-style)
+
+
+def draw_line(ax, xy, color, lw, ext, zorder=3):
+    """One run of a line: solid, or as an extension in EXT_STYLE (dashed; thin: solid at 45 % width; pale: full
+    width in the colour washed 55 % towards the paper; hollow: coloured outline with a paper-coloured centre)."""
+    kw = dict(solid_capstyle="butt", solid_joinstyle="round", dash_capstyle="butt")
+    x, y = xy[:, 0], xy[:, 1]
+    if not ext:
+        ax.plot(x, y, color=color, lw=lw, zorder=zorder, **kw)
+    elif EXT_STYLE == "dashed":
+        ax.plot(x, y, color=color, lw=lw, linestyle=(0, (DASH_ON, DASH_OFF)), zorder=zorder, **kw)
+    elif EXT_STYLE == "thin":
+        ax.plot(x, y, color=color, lw=lw * 0.45, zorder=zorder, **kw)
+    elif EXT_STYLE == "pale":
+        c = np.array(matplotlib.colors.to_rgb(color))
+        ax.plot(x, y, color=c + (np.array(matplotlib.colors.to_rgb(LAND)) - c) * 0.55, lw=lw, zorder=zorder, **kw)
+    elif EXT_STYLE == "hollow":
+        ax.plot(x, y, color=color, lw=lw, zorder=zorder, **kw)
+        ax.plot(x, y, color=LAND, lw=lw * 0.45, zorder=zorder + 0.01, **kw)
+
+
 def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     order = sorted({l for e in edges for l in e["lines"]})
     limits = gpd.read_file(LIMITS).to_crs(CRS)
@@ -1155,12 +1194,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 part = c[max(a_ - 1, 0):b_]
                 if len(part) < 2:
                     continue
-                if ext[a_]:
-                    ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, dash_capstyle="butt",
-                            linestyle=(0, (DASH_ON, DASH_OFF)), zorder=3)
-                else:
-                    ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
-                            solid_joinstyle="round", zorder=3)
+                draw_line(ax, part, colors.get(l, "#888"), lw, ext[a_])
             g = LineString(c)
             drawn.append(g)
             paths[l].append(g)
@@ -1357,8 +1391,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 ("dash", "wydłużenia: mniej niż 1/4 kursów linii")]
     for k, (kind, text) in enumerate(key_rows):
         y = ky - k * row * 0.75
-        ax.plot([kx0, kx1], [y, y], color="#8a8a8a", lw=lw, solid_capstyle="butt", dash_capstyle="butt",
-                linestyle=(0, (DASH_ON, DASH_OFF)) if kind == "dash" else "-", zorder=9)
+        draw_line(ax, np.array([[kx0, y], [kx1, y]]), "#8a8a8a", lw, kind == "dash", zorder=9)
         if kind == "dot":
             ax.scatter([(kx0 + kx1) / 2], [y], s=(lw * 0.7) ** 2, color=INK, zorder=9.5, linewidths=0)
         elif kind == "arrow":
@@ -1382,7 +1415,10 @@ def main():
     ap.add_argument("--date", default="20261118")
     ap.add_argument("--out", default=str(ROOT / "png" / "bus_network_city.png"))
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--ext-style", choices=["dashed", "thin", "pale", "hollow"], default=None)
     args = ap.parse_args()
+    global EXT_STYLE
+    EXT_STYLE = args.ext_style or EXT_STYLE
     geoms, n_shape, line_of, stations, line_trips = load(args.date)
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
