@@ -832,10 +832,63 @@ def station_access(edges, stations):
                 ramp = [Sx + perp * (ra + (rb - ra) * f) for f in np.linspace(0, 1, 9)]
                 rest = list(LineString([tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1])
                             .simplify(SIMPLIFY_M).coords)
-                kg = [tuple(Sx)] + [tuple(p) for p in ramp] + rest                       # drawn as is (raw)
                 ss_ = lambda t: t * t * (3 - 2 * t)  # noqa: E731
-                kprof = [ksh, ksh] + [ksh * (1 - ss_(f)) for f in np.linspace(0, 1, 9)[1:]] + [0.0] * len(rest)
+                # D / F / H keep hugging the spur (user, 2026-11-17): round its bottom on their lanes outside the
+                # hairpins, north along the outside of the east leg, then a right turn onto Kościuszki at the
+                # height of its real corner, east to that corner and on along the real street (unchanged). P is the
+                # path of their middle lane; the centreline is P moved by the lane shift, which fades to 0 along
+                # the horizontal so they arrive on the street's centreline
+                north = -dv
+                Rb = RHO - ksh                                      # radius of their middle lane round the hairpins
+                E1 = O_ + perp * Rb
+                h_up = float(np.dot(corner - E1, north))
+                Rt = float(np.clip(0.75 * h_up, 60.0, 140.0))
+                lift = max(h_up - Rt, 0.0)
+                P_ = [O_ + Rb * (dv * math.cos(a) + perp * math.sin(a)) for a in np.linspace(0, math.pi / 2, 24)]
+                P_ += [E1 + north * t for t in np.linspace(0, lift, max(2, int(lift / 8)))[1:]]
+                T0 = E1 + north * lift
+                cR = T0 + perp * Rt
+                P_ += [cR - perp * Rt * math.cos(a) + north * Rt * math.sin(a) for a in np.linspace(0, math.pi / 2, 14)[1:]]
+                H0 = P_[-1]
+                corner = corner + perp * float(np.dot(np.array(N1) - corner, perp))   # straight under the junction
+                hl = float(np.dot(corner - H0, perp))
+                n_h = max(2, int(hl / 8))
+                # the horizontal turns onto the real street before its corner, on an arc of radius Rc
+                sdir = np.array(N1) - corner                    # straight on to the junction after the turn
+                sdir = sdir / max(np.hypot(*sdir), 1e-9)
+                th_c = math.acos(float(np.clip(perp @ sdir, -1, 1)))
+                Rc = 70.0
+                tl_c = Rc * math.tan(th_c / 2)
+                hl -= tl_c
+                n_h = max(2, int(hl / 8))
+                P_ += [H0 + perp * t for t in np.linspace(0, hl, n_h)[1:]]
+                A0 = P_[-1]
+                lc = np.array([-perp[1], perp[0]])
+                if lc @ sdir < 0:
+                    lc = -lc
+                cc = A0 + lc * Rc
+                a_s = math.atan2(*(A0 - cc)[::-1])
+                sg_ = 1 if (perp[0] * sdir[1] - perp[1] * sdir[0]) > 0 else -1
+                arc_c = [cc + Rc * np.array([math.cos(a_s + sg_ * th_c * f), math.sin(a_s + sg_ * th_c * f)])
+                         for f in np.linspace(0, 1, 10)[1:]]
+                P_ += arc_c
+                P_ = np.array(P_)
+                # the shift fades gently along the whole way from halfway round the bottom to the corner (a short
+                # fade bends the lanes: the shift is ~5 lanes), so the lanes run on P and reach the street centred
+                sP = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(P_, axis=0).T))])
+                s0 = sP[12]                                  # halfway round the bottom ... to the last turn
+                s1 = sP[len(P_) - len(arc_c) - 1]
+                fz_ = np.clip((sP - s0) / max(s1 - s0, 1.0), 0, 1)
+                w_ = ksh * (1 - np.array([ss_(float(f)) for f in fz_]))
+                tg = np.gradient(P_, axis=0)
+                tg /= np.maximum(np.hypot(*tg.T), 1e-9)[:, None]
+                C_ = P_ - np.stack([-tg[:, 1], tg[:, 0]], axis=1) * w_[:, None]
+                C_[0] = Sx
+                rest = [tuple(P_[-1]), tuple(N1)]
+                kg = [tuple(p) for p in C_] + rest[1:]
+                kprof = list(w_) + [0.0] * (len(rest) - 1)
                 keep.append(dict(geom=LineString(kg), lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines), raw=True,
+                                 probe_m=6.0,      # its heading at the station: east, as it leaves (not north)
                                  shift_prof=kprof,
                                  schematic=LineString(thr_c).interpolate(0.5, normalized=True)))
                 kos_g = keep[-1]["geom"]
@@ -1921,9 +1974,21 @@ def draw_path(seq, l, edges, orders):
             O2[sel] = O[j]
     # lanes spreading from the incoming bundle onto the dead-end spur's legs ease over a longer stretch
     O = smooth(O2[:, None], RAMP_M)[:, 0]
+    if any(edges[i].get("raw") and "shift_prof" in edges[i] and "down_dir" not in edges[i] for i, _ in seq):
+        # a schematic section with its own shift profile (Kościuszki on the spur: its centreline moves exactly as its
+        # shift fades): that profile is followed closely, not eased over RAMP_M (which bent the lanes)
+        own = np.array([1.0 if edges[e_].get("raw") and "shift_prof" in edges[e_] and "down_dir" not in edges[e_]
+                        else 0.0 for e_ in E])
+        for e_ in set(E[own > 0].tolist()):             # back to the normal easing near its far junction
+            vend = np.array(edges[e_]["v"])
+            own = own * np.where(E == e_, np.clip(np.hypot(*(Q - vend).T) / 150.0, 0, 1), 1.0)
+        own = smooth(own[:, None], 40)[:, 0]
+        O = O * (1 - own) + smooth(O2[:, None], 24)[:, 0] * own
     if U_INFO.get("spur") and any("down_dir" in edges[i] for i, _ in seq):    # only near the spur's top
         d_ = np.hypot(*(Q - np.array(U_INFO["node"])).T)
         w_ = np.clip((450 - d_) / 150, 0, 1)
+        w_ = w_ * np.array([0.0 if edges[e_].get("raw") and "down_dir" not in edges[e_] else 1.0 for e_ in E])
+        w_ = smooth(w_[:, None], 30)[:, 0]          # (not on Kościuszki: drawn with exact lanes, raw)
         if "spur_east" in FIX:      # not where a line turns off the east leg (A onto Sidorska east): its turn is exact
             w_ = w_ * np.array([0.0 if (e_ == U_INFO["right"] or edges[e_].get("u_turn_arm") and
                                         edges[e_]["geom"].distance(Point(U_INFO["node"])) < 1 and
@@ -2175,10 +2240,16 @@ STREET_LABELS = {
     "Orzechowa": "Orzechowa", "Aleja Solidarności": "al. Solidarności", "Akademicka": "Akademicka",
     "Łomaska": "Łomaska", "Francuska": "Francuska", "Białka": "Białka", "Królowej Jadwigi": "Królowej Jadwigi",
     "Podleśna": "Podleśna", "Lubelska": "Lubelska",
+    "Sitnicka": "Sitnicka", "Jana III Sobieskiego": "Sobieskiego", "Robotnicza": "Robotnicza",
+    "Armii Krajowej": "Armii Krajowej", "Koncertowa": "Koncertowa", "Aleja Riada Haidara": "al. Haidara",
 }
 STREET_SIZE, STREET_COLOR = 10.5, "#8e8e8e"
-STREET_NEAR_CENTRE = {"Sidorska", "Francuska"}
-STREET_PIN = {"Zamkowa": (782262, 471235), "Gabriela Narutowicza": (782680, 470833)}  # names kept here (user)
+STREET_NEAR_CENTRE = {"Sidorska", "Francuska", "Lubelska", "Janowska"}
+OFFSET_OK = set()   # street names allowed further out from their bundle
+# names placed by hand (map x, y, angle): where the drawn lines run off the street (C / K on Sobieskiego)
+STREET_MANUAL = {"Jana III Sobieskiego": (781985, 472605, 0.0)}
+STREET_PIN = {"Zamkowa": (782262, 471235), "Gabriela Narutowicza": (782680, 470833),
+              "Jana III Sobieskiego": (782190, 472702)}  # names kept here (user)
 
 
 def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
@@ -2222,7 +2293,17 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
     n_done = 0
     centre = np.mean([np.array(e["geom"].interpolate(0.5, normalized=True).coords[0]) * len(e["lines"])
                       for e in edges], axis=0) / np.mean([len(e["lines"]) for e in edges])
+    for street, (mx, my, ma) in STREET_MANUAL.items():
+        text = STREET_LABELS[street]
+        ax.text(mx, my, text, fontproperties=font(STREET_SIZE), color=STREET_COLOR, ha="center", va="center",
+                rotation=ma, rotation_mode="anchor", zorder=6.5,
+                path_effects=[patheffects.withStroke(linewidth=2.5, foreground=LAND)])
+        w = len(text) * STREET_SIZE * 0.55 * m_per_pt
+        placed.append(Point(mx, my).buffer(w / 2))
+        n_done += 1
     for street, cs in sorted(cands.items(), key=lambda kv: -len(kv[1])):
+        if street in STREET_MANUAL:
+            continue
         text = STREET_LABELS[street]
         w = len(text) * STREET_SIZE * 0.55 * m
         h = STREET_SIZE * 1.15 * m
@@ -2243,15 +2324,22 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
             horizontal = abs(t[0]) >= abs(t[1])
             sides = [-1, 1] if horizontal else ([-1, 1] if t[1] > 0 else [1, -1])
             for sd_ in sides[:1] if pref else sides[1:]:
-                cen = p + nrm * sd_ * (half + SPACING * 0.5 + h / 2)
-                poly = Polygon([cen + t * w / 2 + nrm * h / 2, cen - t * w / 2 + nrm * h / 2,
-                                cen - t * w / 2 - nrm * h / 2, cen + t * w / 2 - nrm * h / 2])
-                if not frame.contains(poly):
-                    continue
-                tol = 120 if street in STREET_PIN else 0       # a pinned name may graze a line's edge (box corner)
-                if sum(occ[k].intersection(poly).area for k in occ_tree.query(poly)) > tol:
-                    continue
-                if any(q.buffer(12).intersects(poly) for q in placed):
+                ok_ = False
+                # lines drawn off their street's centre (held lanes: C at Terebelska Pętla) push the name out
+                for extra in ((0.0,) if street not in OFFSET_OK else (0.0, 1.5, 3.0, 4.5)):
+                    cen = p + nrm * sd_ * (half + SPACING * (0.5 + extra) + h / 2)
+                    poly = Polygon([cen + t * w / 2 + nrm * h / 2, cen - t * w / 2 + nrm * h / 2,
+                                    cen - t * w / 2 - nrm * h / 2, cen + t * w / 2 - nrm * h / 2])
+                    if not frame.contains(poly):
+                        continue
+                    tol = 120 if street in STREET_PIN else 0   # a pinned name may graze a line's edge (box corner)
+                    if sum(occ[k].intersection(poly).area for k in occ_tree.query(poly)) > tol:
+                        continue
+                    if any(q.buffer(12).intersects(poly) for q in placed):
+                        continue
+                    ok_ = True
+                    break
+                if not ok_:
                     continue
                 ang = math.degrees(math.atan2(t[1], t[0]))
                 ax.text(cen[0], cen[1], text, fontproperties=font(STREET_SIZE), color=STREET_COLOR, ha="center",
