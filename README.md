@@ -99,7 +99,7 @@ Needs pandas, numpy, shapely, pyproj, osmnx (1.9), networkx; Java 17+ for the va
   (both verified by the user).
 - Feed built: 13 lines (A–M, T weekends only), 318 posts / 172 stations, 1249 trips, 25 613 stop times, 102 shapes;
   valid 10.11–31.12.2026.
-- MobilityData validator v8.0.1: **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`
+- MobilityData validator v8.0.1 (re-run 2026-11-17 on the feed with the Białka / termini shape fixes): **0 errors, 0 warnings**, 6 info `trip_headsign_matches_intermediate_stop`
   (loop trips, expected).
 - `agency_url` / `feed_contact_url` = https://mzkbp.pl/ (operator site).
 - Animation: `animate_buses.py` (own implementation; positions interpolated on `shape_dist_traveled`, style after
