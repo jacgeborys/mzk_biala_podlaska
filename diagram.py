@@ -1006,12 +1006,25 @@ def lane(orders, i, l):
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING + LANE_SHIFT.get(i, 0.0)
 
 
+def edge_extent(edges, orders, i):
+    """How far the farthest lane of edge i lies from its centreline (lane shifts of an arm of the U included)."""
+    e = edges[i]
+    m = max((abs(lane(orders, i, l)) for l in e["lines"]), default=0.0)
+    if e.get("shift_all") and "end_shift" in e:
+        m += abs(e["end_shift"][1])
+    if "shift_prof" in e:                       # a leg of the U: at the crossing, pushed outwards
+        m += max(abs(x) for x in e["shift_prof"])
+    if i in HOLD:
+        m = max([m] + [abs(o) for o in HOLD[i][2].values()])
+    return m
+
+
 def is_precise(e):
     """A section drawn precisely along its streets: carries only PRECISE_LINES (G where it runs alone)."""
     return bool(e["lines"]) and e["lines"] <= PRECISE_LINES and not e.get("raw")
 
 
-def fillet(c, R):
+def fillet(c, R, cap=None):
     """Every corner of a polyline replaced by a circular arc (tangent length up to half of each leg), as in
     subway_like_map: a bundle offset from it bends as concentric arcs. Returns the points and, per point, the
     index of the input segment it belongs to (an arc's first half to the leg before the corner)."""
@@ -1029,7 +1042,8 @@ def fillet(c, R):
             sid.append(i)
             continue
         Ri = R[i] if np.ndim(R) else R               # per-vertex radius (precise lines: small)
-        tl = min(Ri * math.tan(th / 2), seg[i - 1] * 0.5, seg[i] * 0.5)
+        ca, cb = (0.5, 0.5) if cap is None else (cap[i - 1], cap[i])   # share of each leg the arc may use
+        tl = min(Ri * math.tan(th / 2), seg[i - 1] * ca, seg[i] * cb)
         r = tl / math.tan(th / 2)
         T1, T2 = c[i] + v1 * tl, c[i] + v2 * tl
         b = (v1 + v2) / (np.linalg.norm(v1 + v2) + 1e-9)
@@ -1400,6 +1414,54 @@ def arm_shifts(edges, orders):
             e["end_shift"] = edges[e["twin_of"]]["end_shift"]
 
 
+HOLD = {}       # edge -> (node, metres from it, {line: lane left of u -> v}): lanes held past a terminus
+HOLD_M = 200    # ... this far past the junction (the capsule slid along the road sits within it)
+
+
+def hold_lanes(edges, orders, stations, spots):
+    """Lines passing a terminus where other lines end (H, D at Terebelska Pętla, whose capsule is slid north along
+    the road past the junction) keep their lanes HOLD_M past the junction: they cross the capsule parallel to the
+    lines ending there and only then close up (H onto D). Lines joining there (C) run outside them."""
+    for k, (i, base, t, _) in spots.items():
+        if not (stations[k]["term"] - edges[i]["lines"]) or not (stations[k]["term"] & edges[i]["lines"]):
+            continue
+        node = min((edges[i]["u"], edges[i]["v"]), key=lambda n: np.hypot(*(np.array(n) - base)))
+        held = {l: lane(orders, i, l) * (1 if edges[i]["v"] == node else -1) for l in edges[i]["lines"]}
+        cur, left = i, float(HOLD_M)
+        while left > 0:
+            nxt = [j for j, e in enumerate(edges) if j != cur and node in (e["u"], e["v"]) and e["lines"] & held.keys()
+                   and not e.get("raw")]
+            if not nxt:
+                break
+            j = max(nxt, key=lambda j: len(edges[j]["lines"] & held.keys()))
+            e = edges[j]
+            sj = 1 if e["u"] == node else -1                      # left of travel away from the node = sj * left
+            cont = {l: held[l] for l in e["lines"] if l in held}  # (u -> v)
+            if len(cont) < 2:
+                break
+            offs = dict(cont)
+            others = [l for l in orders[j] if l not in cont]
+            ci = [orders[j].index(l) for l in cont]
+            for l in others:                                       # joining lines: outside, on their side
+                o_ = orders[j].index(l)
+                if o_ > max(ci):
+                    offs[l] = min(offs.values()) - SPACING
+                elif o_ < min(ci):
+                    offs[l] = max(offs.values()) + SPACING
+            c = _SECTIONS[j] if e["u"] == node else _SECTIONS[j][::-1]
+            sd = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(c, axis=0), axis=1))])
+            upto = left if sd[-1] > left + 30 else math.inf
+            if upto < math.inf:                                    # a vertex where the hold ends
+                q = int(np.searchsorted(sd, upto))
+                f = (upto - sd[q - 1]) / (sd[q] - sd[q - 1])
+                c = np.insert(c, q, c[q - 1] + f * (c[q] - c[q - 1]), axis=0)
+                _SECTIONS[j] = c if e["u"] == node else c[::-1]
+            HOLD[j] = (node, upto, {l: o * sj for l, o in offs.items()})
+            left -= sd[-1]
+            held = {l: cont[l] for l in cont}
+            cur, node = j, (e["v"] if e["u"] == node else e["u"])
+
+
 def draw_path(seq, l, edges, orders):
     """Drawn coordinates of one chain (subway_like_map style): each section simplified, corners (inside sections
     and at junctions) replaced by circular arcs of radius CORNER_R, the lane offset eased over RAMP_M m wherever
@@ -1418,6 +1480,15 @@ def draw_path(seq, l, edges, orders):
                 offs = offs + sh * (1 if fwd else -1)
             else:
                 offs[1 if at_start else len(c) - 1] += sh * (1 if fwd else -1)
+        if i in HOLD and l in HOLD[i][2] and len(c) > 1:   # lanes held past a terminus (hold_lanes)
+            node, upto, offd = HOLD[i]
+            sd = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(c, axis=0), axis=1))])
+            if (edges[i]["u"] if fwd else edges[i]["v"]) == node:
+                inside = sd <= upto + 1e-6                          # segment ending at the point
+            else:
+                inside = np.concatenate([[False], (sd[-1] - sd[:-1]) <= upto + 1e-6])
+            inside[0] = inside[1]
+            offs = np.where(inside, offd[l] * (1 if fwd else -1), offs)
         if "shift_prof" in edges[i]:                # whole bundle shifted (the U's legs, side by side at the top)
             pr = np.array(edges[i]["shift_prof"], float)
             offs = offs + (pr if fwd else -pr[::-1])
@@ -1435,7 +1506,25 @@ def draw_path(seq, l, edges, orders):
     ns = len(seg_edge)
     Rv = np.array([PRECISE_R if all(is_precise(edges[seg_edge[q]]) for q in (v - 1, v) if 0 <= q < ns)
                    else CORNER_R for v in range(len(P))], float)
-    F, sid = fillet(P, Rv)
+    # a corner is never tighter than the widest bundle meeting there (lanes and lane shifts included), so its inner
+    # lanes do not fold where a shifted arm eases back (B, C, I from Łomaska into Sidorska; A, H at al. Jana Pawła
+    # II); same radius for every line through it, so the lanes stay concentric
+    # (at the Dworzec PKP crossing: an arm turning into a leg of the U, whose first 300 m are straight, may use 3/4
+    # of that straight, so the shifted Sidorska arm's inner lanes get room)
+    capf = np.full(max(ns, 1), 0.5)
+    for v in range(1, len(P) - 1):
+        adj = [seg_edge[q] for q in (v - 1, v) if 0 <= q < ns]
+        if any(is_precise(edges[k]) for k in adj):
+            continue
+        raw = [k for k in adj if edges[k].get("raw")]
+        if raw:
+            if len(raw) == len(adj) or not U_INFO or np.hypot(*(P[v] - np.array(U_INFO["node"]))) > 1:
+                continue
+            for q in (v - 1, v):
+                if 0 <= q < ns and edges[seg_edge[q]].get("raw"):
+                    capf[q] = 0.75
+        Rv[v] = max(Rv[v], max(edge_extent(edges, orders, k) for k in adj) + 2 * SPACING)
+    F, sid = fillet(P, Rv, capf)
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
     keep = np.concatenate([[True], np.diff(s) > 1e-6])
     F, s, sid = F[keep], s[keep], np.array(sid)[keep]
@@ -1444,8 +1533,26 @@ def draw_path(seq, l, edges, orders):
     ds = np.append(np.arange(0, s[-1], STEP_M), s[-1])
     Q = np.column_stack([np.interp(ds, s, F[:, 0]), np.interp(ds, s, F[:, 1])])
     k_ = np.clip(sid[np.clip(np.searchsorted(s, ds, side="right") - 1, 0, len(sid) - 1)], 0, len(seg_off) - 1)
-    O, E = seg_off[k_], seg_edge[k_]
-    O = smooth(O[:, None].astype(float), RAMP_M)[:, 0]
+    O, E = seg_off[k_].astype(float), seg_edge[k_]
+    # a lane change at a junction happens on the side with fewer lines: a line leaving a bundle moves over once it
+    # has left it, one joining a bundle before it joins (the ease is centred on the junction otherwise, and A slid
+    # over H for 60 m before turning off al. Jana Pawła II)
+    half = RAMP_M / 2
+    O2 = O.copy()
+    bnd = [j for j in range(1, len(E)) if E[j] != E[j - 1]]
+    for n_, j in enumerate(bnd):
+        na, nb = len(edges[E[j - 1]]["lines"]), len(edges[E[j]]["lines"])
+        if na == nb or O[j] == O[j - 1]:
+            continue
+        lo_ = ds[bnd[n_ - 1]] if n_ else -math.inf
+        hi_ = ds[bnd[n_ + 1]] if n_ + 1 < len(bnd) else math.inf
+        if na > nb:                                   # leaving: hold the old lane a little into the new section
+            sel = (ds >= ds[j]) & (ds < min(ds[j] + half, hi_))
+            O2[sel] = O[j - 1]
+        else:                                         # joining: take the new lane a little before it
+            sel = (ds < ds[j]) & (ds >= max(ds[j] - half, lo_))
+            O2[sel] = O[j]
+    O = smooth(O2[:, None], RAMP_M)[:, 0]
     t = np.gradient(Q, axis=0)
     t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
@@ -1657,6 +1764,8 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     paths = defaultdict(list)                     # line -> drawn LineStrings
     line_ends = []                                # (line, end point, direction pointing out of the line)
     spots = station_spots(stations, edges)
+    hold_lanes(edges, orders, stations, spots)
+    ending_cut = defaultdict(set)                 # terminus station -> lines cut there
     term_cut = defaultdict(list)                  # terminus station -> points where lines ending there were cut
     shifted = {}      # terminus station -> (station point moved along the road, tip: the peak of a side line's arc)
     def pale_end(l, k):
@@ -1701,6 +1810,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 else:
                     c, E, Q = np.vstack([p, c[b:]]), np.append(E[b], E[b:]), np.vstack([Q[b], Q[b:]])
                 term_cut[k].append(p)
+                ending_cut[k].add(l)
                 return c, E, Q, k
         # ends just short of the station (I at Chłodna 1: inbound ends 17 m before it, outbound starts 17 m after):
         # carried on along the end's direction to the station line, so both meet at the capsule
@@ -1716,6 +1826,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 else:
                     c, E, Q = np.vstack([p, c]), np.append(E[0], E), np.vstack([Q[0], Q])
                 term_cut[k].append(p)
+                ending_cut[k].add(l)
                 return c, E, Q, k
         return c, E, Q, None
 
@@ -1848,6 +1959,27 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                     sch[i] = float(n_ < EXT_SHARE * line_trips[l])
             forced = np.array([sch.get(i, np.nan) for i in E])
             ext = extension_mask(Q, shapes.get(l, []), line_trips[l], forced)
+            # solid / pale node to node: one value per piece between junctions and the line's termini (the station
+            # lines), taken by length from the point-by-point mask, so the pale part starts exactly at the capsule
+            # (Sidorska Pętla) and not wherever the shapes happen to thin out
+            cuts = {j for j in range(1, len(c)) if E[j] != E[j - 1]}
+            for k_, s_ in stations.items():
+                if l not in s_["term"] or k_ not in spots:
+                    continue
+                _, b0, t0, _ = spots[k_]
+                if k_ in shifted:
+                    b0, _, t0 = shifted[k_]
+                n0 = np.array([-t0[1], t0[0]])
+                sv = (c - b0) @ t0
+                for j in range(1, len(c)):
+                    if np.sign(sv[j]) != np.sign(sv[j - 1]) and abs((c[j] - b0) @ n0) < 4 * SPACING + 60                             and np.hypot(*(c[j] - b0)) < 200:
+                        cuts.add(j)
+            cuts = [0] + sorted(cuts) + [len(c)]
+            seg_l = np.append(np.hypot(*np.diff(c, axis=0).T), 0.0)
+            for a_, b_ in zip(cuts, cuts[1:]):
+                w_ = seg_l[a_:b_]
+                if w_.sum() > 0:
+                    ext[a_:b_] = (w_ * ext[a_:b_]).sum() / w_.sum() >= 0.5
             for k_, (b2, apex, t2) in shifted.items():           # a line meeting a moved capsule's tip (C at
                 if l in stations[k_]["term"]:                     # Terebelska Pętla) is solid up to the capsule
                     near_ = (np.hypot(*(c - apex).T) < 110) & ((c - b2) @ t2 < 0)
@@ -1978,6 +2110,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             b2, apex, t2 = shifted[sid]
             nrm = np.array([-t2[1], t2[0]])
             sd2 = [float((p - b2) @ nrm) for p in term_cut.get(sid, [])] or [0.0]
+            for l, _, _, _, c, _, _ in chains:                     # lines passing through it (H, D): spanned too
+                if l in edges[i]["lines"] and l not in ending_cut.get(sid, set()):
+                    sd2 += [x for x, _ in crossings(c, b2, t2) if abs(x) < 4 * SPACING + 60]
             sa = float((apex - b2) @ nrm)
             far = max(sd2, key=lambda v: abs(v - sa))        # the lane farthest from the peak, padded outwards
             far += SPACING * 0.55 * (1 if far > sa else -1)
@@ -1998,9 +2133,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         """Width of a row of bullets in points (a diamond carries its trips a day after it)."""
         return sum(15 + (4 + 5.2 * len(str(trips.get(l, 0))) if mk == "D" else 0) for l, mk in bullets)
 
-    # termini off the map (Grabanów ODR, Czosnówka, ...): named by the edge where their line leaves the map, a
-    # white arrowhead on the line just inside the edge pointing out (bullets as on the map: diamonds with the trips
-    # a day for ends of extensions)
+    # termini off the map (Grabanów ODR, Czosnówka, ...): named by the edge where their line leaves the map, next to
+    # a thick black arrow beside the line(s), parallel to them, pointing out (on the side clear of other lines;
+    # bullets as on the map: diamonds with the trips a day for ends of extensions)
     mapbox = box(x0, y0, x1, y1)
     exits = []                                    # (crossing point, outward unit vector, line, name, trips there)
     for (l, n), sts in END_STATIONS.items():
@@ -2034,26 +2169,62 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         v = (b - a) / max(np.hypot(*(b - a)), 1e-9)
         if mapbox.contains(Point(b)):
             v = -v                                # pointing out of the map
-        inner = d - 140 if not mapbox.contains(Point(b)) else d + 140
-        tip = np.array(g.interpolate(min(max(inner, 0), g.length)).coords[0])
-        ang = math.degrees(math.atan2(v[1], v[0])) - 90
-        col = np.array(matplotlib.colors.to_rgb(colors.get(l, "#888")))
-        if sum(n_ for g_, n_ in shapes.get(l, []) if g_.distance(Point(tip)) < EXT_TOL) < EXT_SHARE * line_trips[l]:
-            col = col + (np.array(matplotlib.colors.to_rgb(LAND)) - col) * 0.55     # pale there, as the line
-        ax.scatter([tip[0]], [tip[1]], marker=(3, 0, ang), s=(lw * 3.4) ** 2, color=col, zorder=4.5,
-                   edgecolors=LAND, linewidths=lw * 0.3)
-        exits.append((np.array(q.coords[0]), v, tip, l, n, sum(stations[s_]["trips"].get(l, 0) for s_ in sts)))
-    off_requests = []                             # one label per name and exit: (name, base, zone, bullets, trips)
-    for q, v, tip, l, n, tr_ in sorted(exits, key=lambda x: (x[4], x[3])):
-        for r in off_requests:
-            if r[0] == n and np.hypot(*(r[1] - (q - v * 200))) < 400:
-                r[3].append((l, "o" if tr_ >= EXT_SHARE * line_trips[l] else "D"))
-                r[4][l] = tr_
-                r[2] = r[2].union(Point(tip).buffer(SPACING))
+        inward = -1 if not mapbox.contains(Point(b)) else 1        # along g, into the map
+        exits.append((np.array(q.coords[0]), v, g, d, inward, l, n,
+                      sum(stations[s_]["trips"].get(l, 0) for s_ in sts)))
+    groups = []                                   # one label per name and exit: [name, exits]
+    for ex in sorted(exits, key=lambda x: (x[6], x[5])):
+        for gr in groups:
+            if gr[0] == ex[6] and np.hypot(*(gr[1][0][0] - ex[0])) < 300:
+                gr[1].append(ex)
                 break
         else:
-            off_requests.append([n, q - v * 200, Point(tip).buffer(SPACING),
-                                 [(l, "o" if tr_ >= EXT_SHARE * line_trips[l] else "D")], {l: tr_}])
+            groups.append([ex[6], [ex]])
+    off_requests = []                             # (name, base, zone, bullets, trips)
+    from shapely.ops import substring
+    for n, exs in groups:
+        q, v, g, d, inward, l0, _, _ = exs[0]
+        # the arrow: beside the line(s), parallel, from 380 m to 100 m inside the edge, pointing out
+        a_d, b_d = d + inward * 380, d + inward * 100
+        if not (0 <= min(a_d, b_d) and max(a_d, b_d) <= g.length):
+            continue
+        piece = substring(g, a_d, b_d)            # inside -> edge
+        mid = np.array(piece.interpolate(0.5, normalized=True).coords[0])
+        pa, pb = np.array(piece.coords[0]), np.array(piece.coords[-1])
+        tv = (pb - pa) / max(np.hypot(*(pb - pa)), 1e-9)
+        nv = np.array([-tv[1], tv[0]])
+        rel = [float((np.array(gg.interpolate(gg.project(Point(mid))).coords[0]) - mid) @ nv)
+               for _, _, gg, _, _, _, _, _ in exs]
+        best = None
+        for sd_ in (1, -1):
+            off = sd_ * (max(sd_ * r_ for r_ in rel) + SPACING * 0.5 + 55)
+            arr = piece.offset_curve(off)
+            if arr.is_empty or arr.geom_type != "LineString":
+                continue
+            ac = np.array(arr.coords)
+            if np.hypot(*(ac[-1] - pa)) < np.hypot(*(ac[0] - pa)):
+                ac = ac[::-1]                     # inside -> edge
+            hit = sum(gg.distance(LineString(ac)) < SPACING for gg in drawn)
+            if best is None or hit < best[0]:
+                best = (hit, ac, sd_, off)
+        if best is None:
+            continue
+        _, ac, sd_, off = best
+        head_l, head_w = 85.0, 42.0
+        L_ = LineString(ac)
+        shaft = substring(L_, 0, L_.length - head_l * 0.6)
+        ax.plot(*np.array(shaft.coords).T, color=INK, lw=lw * 0.9, solid_capstyle="butt", zorder=6.4)
+        tip_ = ac[-1]
+        hb = np.array(L_.interpolate(L_.length - head_l).coords[0])
+        hv = (tip_ - hb) / max(np.hypot(*(tip_ - hb)), 1e-9)
+        hn = np.array([-hv[1], hv[0]])
+        ax.add_patch(plt.Polygon([tip_, hb + hn * head_w, hb - hn * head_w], closed=True, color=INK, zorder=6.4,
+                                 linewidth=0))
+        drawn.append(L_.buffer(head_w * 0.6))
+        bullets = [(l, "o" if tr_ >= EXT_SHARE * line_trips[l] else "D") for _, _, _, _, _, l, _, tr_ in exs]
+        trips = {l: tr_ for _, _, _, _, _, l, _, tr_ in exs}
+        amid = np.array(L_.interpolate(0.4, normalized=True).coords[0])
+        off_requests.append((n, amid + nv * sd_ * 60, L_.buffer(head_w + 10), bullets, trips))
 
     # label placement: as close to the stop as possible (16 directions, sliding outwards from the capsule),
     # off other names at any cost, off the lines where that costs little distance
