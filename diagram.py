@@ -65,6 +65,7 @@ EXT_SHARE = 0.5     # where a line runs with under this share of its trips of th
 # (U_TOP_M + S-bend + U_HALF_M, 582 m; was 690 with a 285-300 m straight top)
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_STYLE = "spur"  # Dworzec PKP: u / untangle / under / spur / box (--station; user chose spur, 2026-11-17)
+KOS_STYLE = "real"       # Kościuszki on the spur: real / corner / sweep / diag (--kos)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 260        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
@@ -835,6 +836,55 @@ def station_access(edges, stations):
                 kg = [tuple(Sx)] + [tuple(p) for p in ramp] + rest                       # drawn as is (raw)
                 ss_ = lambda t: t * t * (3 - 2 * t)  # noqa: E731
                 kprof = [ksh, ksh] + [ksh * (1 - ss_(f)) for f in np.linspace(0, 1, 9)[1:]] + [0.0] * len(rest)
+                if KOS_STYLE != "real":
+                    # Kościuszki drawn schematically: straight east along the spur's bottom (lanes kept outside the
+                    # hairpins) to below the junction on Sidorska, one smooth turn north (corner: R 150 m; sweep:
+                    # R 350 m; diag: a 45-degree diagonal instead), straight up to the junction
+                    across = float(np.dot(np.array(N1) - Sx, perp))
+                    up_ = float(np.dot(Sx - np.array(N1), dv))
+                    # lanes leave the hairpins' outside on the straight and are back on the centreline before
+                    # the turn, so the turn and the climb to Sidorska carry no sideways shift (no hook)
+                    # the path the lanes should follow (P): straight east at their level outside the hairpins,
+                    # one turn north (corner: R 150 m; sweep: R 350 m; diag: 45 degrees), straight up to the
+                    # junction; the shift fades from ksh to 0 along the straight, and the centreline is solved
+                    # so that centreline + shift lands exactly on P (iterated: the normals are the centreline's)
+                    north = -dv
+                    Sb = Sx - north * (-ksh)
+                    up_ = float(np.dot(np.array(N1) - Sb, north))
+                    P_ = [Sb]
+                    if KOS_STYLE == "diag":
+                        Dg = max(min(up_ - 120.0, across - 380.0, 260.0), 60.0)
+                        xa = across - Dg
+                        P_ += [Sb + perp * x_ for x_ in np.arange(8, xa, 8.0)]
+                        a0 = Sb + perp * xa
+                        P_ += [a0 + (perp + north) * t_ for t_ in np.arange(8, Dg, 8.0)]
+                        b0 = a0 + (perp + north) * Dg
+                    else:
+                        R_ = min(150.0 if KOS_STYLE == "corner" else 350.0, up_ - 100.0, across - 200.0)
+                        xa = across - R_
+                        P_ += [Sb + perp * x_ for x_ in np.arange(8, xa, 8.0)]
+                        a0 = Sb + perp * xa
+                        ctr = a0 + north * R_
+                        P_ += [ctr - north * R_ * math.cos(t_) + perp * R_ * math.sin(t_)
+                               for t_ in np.linspace(0, math.pi / 2, max(6, int(R_ * math.pi / 2 / 8)))[1:]]
+                        b0 = P_[-1]
+                    rest_up = float(np.dot(np.array(N1) - b0, north))
+                    P_ += [b0 + north * t_ for t_ in np.arange(8, rest_up, 8.0)] + [np.array(N1, float)]
+                    P_ = np.array(P_)
+                    sP = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(P_, axis=0).T))])
+                    s_a = sP[int(np.argmin(np.hypot(*(P_ - a0).T)))]
+                    s_b = sP[int(np.argmin(np.hypot(*(P_ - b0).T)))]
+                    fade = max(0.85 * xa, s_a + 0.6 * (s_b - s_a))     # into the turn when the straight is short
+                    w_ = ksh * (1 - np.array([ss_(float(np.clip(v_ / fade, 0, 1))) for v_ in sP]))
+                    tg = np.gradient(P_, axis=0)                 # one step, along P's own normals (parallel
+                    tg /= np.maximum(np.hypot(*tg.T), 1e-9)[:, None]    # curves share them)
+                    nl = np.stack([-tg[:, 1], tg[:, 0]], axis=1)
+                    C_ = P_ - nl * w_[:, None]
+                    C_[0] = Sx
+                    pts = list(C_)
+                    prof_ = list(w_)
+                    kg = [tuple(p) for p in pts]
+                    kprof = prof_
                 keep.append(dict(geom=LineString(kg), lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines), raw=True,
                                  shift_prof=kprof,
                                  schematic=LineString(thr_c).interpolate(0.5, normalized=True)))
@@ -1921,9 +1971,18 @@ def draw_path(seq, l, edges, orders):
             O2[sel] = O[j]
     # lanes spreading from the incoming bundle onto the dead-end spur's legs ease over a longer stretch
     O = smooth(O2[:, None], RAMP_M)[:, 0]
+    if any(edges[i].get("raw") and "shift_prof" in edges[i] and "down_dir" not in edges[i] for i, _ in seq):
+        # a schematic section with its own shift profile (Kościuszki on the spur: its centreline moves exactly as its
+        # shift fades): that profile is followed closely, not eased over RAMP_M (which bent the lanes)
+        own = np.array([1.0 if edges[e_].get("raw") and "shift_prof" in edges[e_] and "down_dir" not in edges[e_]
+                        else 0.0 for e_ in E])
+        own = smooth(own[:, None], 40)[:, 0]
+        O = O * (1 - own) + smooth(O2[:, None], 24)[:, 0] * own
     if U_INFO.get("spur") and any("down_dir" in edges[i] for i, _ in seq):    # only near the spur's top
         d_ = np.hypot(*(Q - np.array(U_INFO["node"])).T)
         w_ = np.clip((450 - d_) / 150, 0, 1)
+        w_ = w_ * np.array([0.0 if edges[e_].get("raw") and "down_dir" not in edges[e_] else 1.0 for e_ in E])
+        w_ = smooth(w_[:, None], 30)[:, 0]          # (not on Kościuszki: drawn with exact lanes, raw)
         if "spur_east" in FIX:      # not where a line turns off the east leg (A onto Sidorska east): its turn is exact
             w_ = w_ * np.array([0.0 if (e_ == U_INFO["right"] or edges[e_].get("u_turn_arm") and
                                         edges[e_]["geom"].distance(Point(U_INFO["node"])) < 1 and
@@ -2993,7 +3052,10 @@ def main():
     ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--ext-style", choices=["dashed", "thin", "pale", "hollow"], default=None)
     ap.add_argument("--station", choices=["u", "untangle", "under", "spur", "box"], default=None)
+    ap.add_argument("--kos", choices=["real", "corner", "sweep", "diag"], default=None)
     args = ap.parse_args()
+    global KOS_STYLE
+    KOS_STYLE = args.kos or KOS_STYLE
     global EXT_STYLE, STATION_STYLE, STATION_CROSS_W, ABOVE_CROSS_W, U_TOP_M, U_S_R, U_HALF_M
     EXT_STYLE = args.ext_style or EXT_STYLE
     STATION_STYLE = args.station or STATION_STYLE
