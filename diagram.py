@@ -1107,6 +1107,8 @@ def relax_junction_corners(edges, orders):
     for k, e in enumerate(edges):
         if len(e["lines"]) != 1 or e.get("raw") or k not in _SECTIONS:
             continue
+        if np.hypot(*(np.array(e["u"]) - np.array(e["v"]))) < 0.5 * e["geom"].length:
+            continue                       # a loop out and back to the bundle (I via Os. Sitnickie): keep its shape
         for n in (e["u"], e["v"]):
             if len(at.get(n, [])) < 3 or max(len(edges[j]["lines"]) for j in at[n]) < 3:
                 continue
@@ -1878,6 +1880,7 @@ def main():
     ap.add_argument("--date", default="20261118")
     ap.add_argument("--out", default=str(ROOT / "png" / "bus_network_city.png"))
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--ext-style", choices=["dashed", "thin", "pale", "hollow"], default=None)
     args = ap.parse_args()
     global EXT_STYLE
@@ -1898,7 +1901,7 @@ def main():
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
     arm_shifts(edges, orders)
     relax_junction_corners(edges, orders)
-    render(edges, orders, stations, json.load(open(CONFIG, encoding="utf-8")), args.date, args.out, shapes, line_trips)
+    render(edges, orders, stations, json.load(open(args.config, encoding="utf-8")), args.date, args.out, shapes, line_trips)
 
 
 if __name__ == "__main__":
