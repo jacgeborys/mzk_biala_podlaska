@@ -61,6 +61,7 @@ U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 300        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
+U_ARM_ALL_M = 700    # ... arms shorter than this are shifted along their whole length (straight: Sidorska west, 604 m)
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
@@ -88,8 +89,9 @@ DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota
 
 SHORT_WORKINGS = set()   # (line, end): short turns at Dworzec PKP on the line's main route, not in the legend
 EXT_SIDE = {}       # (line, variant end) -> the main terminus it lies beyond
-LOOP_STREETS = {"L": "Francuska – Armii Krajowej – Okopowa – Akademicka – Narutowicza"}
+LOOP_STREETS = {"L": "Francuska – Armii Krajowej – Glinki – Narutowicza – Jana Pawła II – Francuska"}
 LINE_ENDS = {}      # line -> {terminus name: trip starts + ends}, for the legend
+END_STATIONS = defaultdict(dict)   # (line, terminus name) -> {station: trip starts + ends there}
 EXT_MIN_ENDS = 3    # legend: variant ends with fewer trip starts + ends are not listed
 
 
@@ -173,6 +175,8 @@ def load(date):
     first_last["nm"] = first_last.stop_id.map(stops.set_index("stop_id").stop_name).map(clean_stop)
     for l, g in first_last.groupby("route_id"):
         LINE_ENDS[l] = g.nm.value_counts().to_dict()        # trip starts + ends per terminus name
+        for (nm, sta), c in g.groupby(["nm", "station"]).size().items():
+            END_STATIONS[(l, nm)][sta] = int(c)
     # which main terminus each other variant end lies beyond: the main terminus its trips pass (nearest to it in
     # the stop sequence); a trip passing neither (a short working) goes on the side away from its other end
     # (full stop names here: once cleaned, "Sidorska 5" and the terminus "Sidorska Pętla" would be one)
@@ -733,6 +737,18 @@ def station_access(edges, stations):
         kos_lines = (L & n1_lines) - on_direct                        # leave along Kościuszki
         end_lines = frozenset(l for l in L - kos_lines
                               if sum(1 for f in at(N2) if l in f["lines"]) == 1)  # in and out the same street: end
+        # a line in and out along one arm from a junction where it comes from one street and leaves along another
+        # (B: north from Narutowicza, south to Łomaska, Dworzec PKP a detour along Sidorska) is drawn twice along
+        # that arm, its second pass a lane outside the bundle, and goes round the U: in on one leg, out on the
+        # other (user, 2026-11-17: B from the north on the upper lane, into the U from the east, out to the west)
+        twins = {}                                                    # line -> (arm, its far node, the two others)
+        for l in sorted(end_lines):
+            arm = next(f for f in at(N2) if l in f["lines"])
+            W = far(arm, N2)
+            ws = [f for f in at(W) if l in f["lines"] and f is not arm]
+            if len(ws) == 2:
+                twins[l] = (arm, W, ws)
+        end_lines = end_lines - frozenset(twins)
         u_lines = L - kos_lines - end_lines                           # round the U and back up
         trips = e.get("trips", {})
         tr = lambda ls: {l: trips.get(l, 0) for l in ls}  # noqa: E731
@@ -799,7 +815,29 @@ def station_access(edges, stations):
             d_ = min(60, g_.length / 2)
             q = g_.interpolate(d_ if out[k]["u"] == N2 else g_.length - d_)
             return float(np.dot(np.array(q.coords[0]) - P0, perp))
-        for l in u_lines:
+        for l, (arm, W, ws) in twins.items():
+            b_k = idx[id(arm)]
+            g_ = arm["geom"]
+            s_ = 1 if arm["u"] == W else -1                           # the twin: left of travel from W to N2
+            tw = dict(arm, lines=frozenset({l}), trips={l: arm.get("trips", {}).get(l, 0)}, twin_of=b_k,
+                      twin_side=s_)
+            out.append(tw)
+            t_k = len(out) - 1
+            LANE_SHIFT[b_k] = -s_ * SPACING / 2                       # the bundle half a lane over, the twin outside
+            LANE_SHIFT[t_k] = s_ * len(arm["lines"]) * SPACING / 2
+            # at W: the section coming in on the left of travel towards N2 joins the twin, the other the arm
+            d_ = np.array(g_.interpolate(30 if arm["u"] == W else g_.length - 30).coords[0]) - np.array(W)
+            def leftness(f):
+                h = f["geom"]
+                q = np.array(h.interpolate(30 if f["u"] == W else h.length - 30).coords[0]) - np.array(W)
+                return d_[0] * q[1] - d_[1] * q[0]
+            w_tw, w_arm = sorted(ws, key=leftness, reverse=True)
+            PAIRS[(l, W)] = {t_k: idx[id(w_tw)], idx[id(w_tw)]: t_k, b_k: idx[id(w_arm)], idx[id(w_arm)]: b_k}
+            # at N2: lanes keep their side through the turn down, so the twin takes the leg left of travel down
+            nl = np.array([-dv[1], dv[0]])
+            tw_leg, arm_leg = (right_k, left_k) if float(np.dot(perp, nl)) > 0 else (left_k, right_k)
+            PAIRS[(l, N2)] = {t_k: tw_leg, tw_leg: t_k, b_k: arm_leg, arm_leg: b_k}
+        for l in u_lines - frozenset(twins):
             arms = [k for k, f in enumerate(out) if l in f["lines"] and N2 in (f["u"], f["v"])
                     and k not in (left_k, right_k)]
             if len(arms) != 2 or right_k is None:
@@ -808,7 +846,7 @@ def station_access(edges, stations):
             PAIRS[(l, N2)] = {left_k: w_arm, w_arm: left_k, right_k: e_arm, e_arm: right_k}
         for k, f in enumerate(out):                                   # arms: shifted where they join the legs
             if N2 in (f["u"], f["v"]) and k not in (left_k, right_k):
-                if f["geom"].length >= 2 * U_TOP_M:
+                if f["geom"].length >= U_ARM_ALL_M:
                     f["split_at"] = (N2, U_TOP_M)
                 else:                 # too short to shift back before the next junction (A on Sidorska east,
                     f["shift_all"] = True       # 445 m): shifted all along, so A runs straight between two arcs
@@ -816,7 +854,7 @@ def station_access(edges, stations):
         NODE_W[key(Sx)] = STATION_CROSS_W
         NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
-              f"{sorted(end_lines)}")
+              f"{sorted(end_lines)}, arm drawn twice {sorted(twins)}")
     return out
 
 
@@ -832,8 +870,9 @@ def node_passes(edges):
             nodes[e["u"]].append((i, math.atan2(qu.y - pu.y, qu.x - pu.x), +1))
             nodes[e["v"]].append((i, math.atan2(qv.y - pv.y, qv.x - pv.x), -1))
             continue
-        nodes[e["u"]].append((i, heading_at(g, k), +1))
-        nodes[e["v"]].append((i, heading_at(g, g.length - k) + math.pi, -1))
+        tw = 0.08 * e.get("twin_side", 0)                  # a twin lies beside its arm: just left of it (u -> v)
+        nodes[e["u"]].append((i, heading_at(g, k) + tw, +1))
+        nodes[e["v"]].append((i, heading_at(g, g.length - k) + math.pi - tw, -1))
     return nodes
 
 
@@ -964,7 +1003,7 @@ def best_orders(lines, edges, seed, iters=60000):
 # ---------------------------------------------------------------- 5: drawing geometry
 def lane(orders, i, l):
     ls = orders[i]
-    return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING
+    return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING + LANE_SHIFT.get(i, 0.0)
 
 
 def is_precise(e):
@@ -1178,6 +1217,7 @@ def extension_mask(Q, shapes, total, forced=None):
 
 
 _SECTIONS = {}
+LANE_SHIFT = {}  # edge -> metres its lanes are shifted left (an arm drawn twice for one line: B on Sidorska)
 PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
 HUG_TIPS = {}   # edge -> its hairpin tip as drawn (the stop dot goes there)
 JOINS = {}      # (line, node) -> [(edge, edge)]: how a line with 3+ sections at a node is drawn through it
@@ -1274,6 +1314,9 @@ def relax_junction_corners(edges, orders):
                 c2 = c2[::-1]
                 _SECTIONS[k] = c2 if np.hypot(*(c2[-1] - np.array(n))) <= np.hypot(*(c2[0] - np.array(n)))                     and np.array_equal(end(k, n)[-1], _SECTIONS[k][-1]) else c2[::-1]
                 eased += 1
+    for k, e in enumerate(edges):                   # a twin runs exactly beside its arm
+        if "twin_of" in e:
+            _SECTIONS[k] = _SECTIONS[e["twin_of"]]
     print(f"junction corners relaxed: {dropped} vertices dropped, {eased} single-line corners eased")
 
 
@@ -1352,6 +1395,9 @@ def arm_shifts(edges, orders):
         if d:
             sh = float(np.mean(d))
             e["end_shift"] = (N2, sh if e["v"] == N2 else -sh)
+    for e in edges:                             # a twin moves with its arm (beside it), changing lane in the turn
+        if "twin_of" in e and "end_shift" in edges[e["twin_of"]]:
+            e["end_shift"] = edges[e["twin_of"]]["end_shift"]
 
 
 def draw_path(seq, l, edges, orders):
@@ -1388,7 +1434,7 @@ def draw_path(seq, l, edges, orders):
     # vertices inside a precise section (a line drawn along its real streets, PRECISE_LINES) get small arcs
     ns = len(seg_edge)
     Rv = np.array([PRECISE_R if all(is_precise(edges[seg_edge[q]]) for q in (v - 1, v) if 0 <= q < ns)
-                   else CORNER_R for v in range(len(P))])
+                   else CORNER_R for v in range(len(P))], float)
     F, sid = fillet(P, Rv)
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
     keep = np.concatenate([[True], np.diff(s) > 1e-6])
@@ -1948,10 +1994,66 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()))]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
-    def bullet_w(bullets, sid):
+    def bullet_w(bullets, trips):
         """Width of a row of bullets in points (a diamond carries its trips a day after it)."""
-        return sum(15 + (4 + 5.2 * len(str(stations[sid]["trips"].get(l, 0))) if mk == "D" else 0)
-                   for l, mk in bullets)
+        return sum(15 + (4 + 5.2 * len(str(trips.get(l, 0))) if mk == "D" else 0) for l, mk in bullets)
+
+    # termini off the map (Grabanów ODR, Czosnówka, ...): named by the edge where their line leaves the map, a
+    # white arrowhead on the line just inside the edge pointing out (bullets as on the map: diamonds with the trips
+    # a day for ends of extensions)
+    mapbox = box(x0, y0, x1, y1)
+    exits = []                                    # (crossing point, outward unit vector, line, name, trips there)
+    for (l, n), sts in END_STATIONS.items():
+        if sum(sts.values()) < EXT_MIN_ENDS or (l, n) in SHORT_WORKINGS or not paths.get(l):
+            continue
+        k = max(sts, key=sts.get)
+        if mapbox.contains(Point(stations[k]["xy"])):
+            continue
+        # where the trips to that terminus really leave the map (A to Styrzyniec along Warszawska, not via
+        # Porosiuki, which is nearer as the crow flies): the last edge crossing of its busiest shape ending there
+        pts_ = lambda h: [q for q in (h.geoms if hasattr(h, "geoms") else [h])  # noqa: E731
+                          if not q.is_empty and q.geom_type == "Point"]
+        ref, ref_n = Point(stations[k]["xy"]), 0
+        for g_, n_ in shapes.get(l, []):
+            for at_end in (False, True):
+                if n_ > ref_n and Point(g_.coords[-1 if at_end else 0]).distance(Point(stations[k]["xy"])) < 150:
+                    cr = pts_(g_.intersection(mapbox.exterior))
+                    if cr:
+                        ref, ref_n = (max if at_end else min)(cr, key=g_.project), n_
+        best = None
+        for g in paths[l]:
+            for q in pts_(g.intersection(mapbox.exterior)):
+                dq = q.distance(ref)
+                if best is None or dq < best[0]:
+                    best = (dq, g, q)
+        if best is None:
+            continue
+        _, g, q = best
+        d = g.project(q)
+        a, b = np.array(g.interpolate(max(d - 15, 0)).coords[0]), np.array(g.interpolate(min(d + 15, g.length)).coords[0])
+        v = (b - a) / max(np.hypot(*(b - a)), 1e-9)
+        if mapbox.contains(Point(b)):
+            v = -v                                # pointing out of the map
+        inner = d - 140 if not mapbox.contains(Point(b)) else d + 140
+        tip = np.array(g.interpolate(min(max(inner, 0), g.length)).coords[0])
+        ang = math.degrees(math.atan2(v[1], v[0])) - 90
+        col = np.array(matplotlib.colors.to_rgb(colors.get(l, "#888")))
+        if sum(n_ for g_, n_ in shapes.get(l, []) if g_.distance(Point(tip)) < EXT_TOL) < EXT_SHARE * line_trips[l]:
+            col = col + (np.array(matplotlib.colors.to_rgb(LAND)) - col) * 0.55     # pale there, as the line
+        ax.scatter([tip[0]], [tip[1]], marker=(3, 0, ang), s=(lw * 3.4) ** 2, color=col, zorder=4.5,
+                   edgecolors=LAND, linewidths=lw * 0.3)
+        exits.append((np.array(q.coords[0]), v, tip, l, n, sum(stations[s_]["trips"].get(l, 0) for s_ in sts)))
+    off_requests = []                             # one label per name and exit: (name, base, zone, bullets, trips)
+    for q, v, tip, l, n, tr_ in sorted(exits, key=lambda x: (x[4], x[3])):
+        for r in off_requests:
+            if r[0] == n and np.hypot(*(r[1] - (q - v * 200))) < 400:
+                r[3].append((l, "o" if tr_ >= EXT_SHARE * line_trips[l] else "D"))
+                r[4][l] = tr_
+                r[2] = r[2].union(Point(tip).buffer(SPACING))
+                break
+        else:
+            off_requests.append([n, q - v * 200, Point(tip).buffer(SPACING),
+                                 [(l, "o" if tr_ >= EXT_SHARE * line_trips[l] else "D")], {l: tr_}])
 
     # label placement: as close to the stop as possible (16 directions, sliding outwards from the capsule),
     # off other names at any cost, off the lines where that costs little distance
@@ -1960,16 +2062,18 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     frame = box(x0 + 60, y0 + 60, x1 - 60, y1 - 60)  # names stay on the map (stops outside it get none)
     placed = []
     labelled = set()
-    for prio, _, sid, base, zone, bullets in sorted(requests, key=lambda r: (r[0], r[1])):
-        name = base_name(stations[sid]["name"])
+    todo = [(base_name(stations[sid]["name"]), 14 if prio == 0 else 12.5, base, zone, bullets, stations[sid]["trips"])
+            for prio, _, sid, base, zone, bullets in sorted(requests, key=lambda r: (r[0], r[1]))
+            if mapbox.contains(Point(base))]           # stops off the map: named at the edge instead (below)
+    todo += [(n, 12.5, base, zone, bullets, trips) for n, base, zone, bullets, trips in off_requests]
+    for name, size, base, zone, bullets, trips in todo:
         if name in labelled:
             continue
         labelled.add(name)
-        size = 14 if prio == 0 else 12.5
         w_m = len(name) * size * 0.52 * m_per_pt
         h_m = size * 1.25 * m_per_pt
         if bullets:
-            w_m = max(w_m, bullet_w(bullets, sid) * m_per_pt)
+            w_m = max(w_m, bullet_w(bullets, trips) * m_per_pt)
             h_m += 17 * m_per_pt
         best = None
         for ang in range(0, 360, 22):
@@ -1998,7 +2102,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         # text aligned towards the stop: a name left of its stop ends at the stop's side of the box
         tx = {"left": bb.bounds[0], "right": bb.bounds[2], "center": (bb.bounds[0] + bb.bounds[2]) / 2}[ha]
         ax.text(tx, ty, name, fontproperties=font(size), color=INK, ha=ha, va="center", path_effects=halo, zorder=7)
-        row_w = bullet_w(bullets, sid) * m_per_pt
+        row_w = bullet_w(bullets, trips) * m_per_pt
         bx0 = {"left": tx, "right": tx - row_w, "center": tx - row_w / 2}[ha]
         xo = 0.0
         for l, mk in bullets:  # lines ending here: bullets under the name (diamond: variant, with its trips a day)
@@ -2009,7 +2113,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
             xo += 15
             if mk == "D":
-                n_ = stations[sid]["trips"].get(l, 0)
+                n_ = trips.get(l, 0)
                 ax.text(bx + 8 * m_per_pt, by, f"{n_}", fontproperties=font(8.5), color="#666", ha="left",
                         va="center", zorder=7.1, path_effects=halo)
                 xo += 4 + 5.2 * len(str(n_))
