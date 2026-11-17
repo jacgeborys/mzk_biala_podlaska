@@ -70,7 +70,7 @@ TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoi
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
-MAIN_TERMINUS = 0.5               # a station is a line's terminus when this share of its trips start or end there
+MAIN_TERMINUS = 0.25              # a station is a line's terminus when this share of its trips start or end there (= EXT_SHARE)
 CONNECT_M = 500     # a line broken into pieces is joined along the corridors if the gap is at most this long
 DROP_M = 150        # pieces of a line shorter than this that cannot be joined are dropped (strays)
 END_JOIN_M = 400    # a loose end of a line inside the network continues this far at most to reach the line again
@@ -1244,6 +1244,9 @@ def station_spots(stations, edges):
     for sid, s in stations.items():
         pt = Point(s["xy"])
         cand = [i for i in tree.query(pt.buffer(90)) if edges[i]["lines"] & s["lines"]]
+        if not cand:      # a stop beyond the drawn end of its line (Ekologiczna, 217 m past E's end): still placed
+            cand = [i for i in tree.query(pt.buffer(250)) if edges[i]["lines"] & s["lines"]
+                    and geoms[i].distance(pt) < 250]
         cand = [i for i in cand if not stub(i, pt)] or cand
         if not cand:
             continue
@@ -1743,7 +1746,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             far += SPACING * 0.55 * (1 if far > sa else -1)
             a_, b_ = b2 + nrm * far, b2 + nrm * sa
             base = b2
-        if not any(n_ == base_name(st_["name"]) and np.hypot(*(q_ - base)) < 150 for n_, q_ in capsuled):
+        far_stop = np.hypot(*(st_["xy"] - base)) > 90           # placed by the fallback: the diamond marks it
+        if not far_stop and not any(n_ == base_name(st_["name"]) and np.hypot(*(q_ - base)) < 150
+                                    for n_, q_ in capsuled):
             capsuled.add((base_name(st_["name"]), tuple(base)))
             capsule(a_, b_)
         zone = LineString([a_, b_]).buffer(cap_r + 5)
@@ -1829,7 +1834,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     ax.text(px0 + pw * 0.05, y1 - (y1 - y0) * 0.135, f"Autobusy MZK · {DAY_NAMES[d.weekday()]} {d:%d.%m.%Y}",
             fontproperties=font(18), color="#d8d8dc", va="center", zorder=9)
     names = {g[0]: n for g, n in zip(line_cfg["groups"], line_cfg["names"])}
-    row = (y1 - y0) * 0.052
+    row = (y1 - y0) * 0.047
     top = y1 - (y1 - y0) * 0.22
     ax.add_patch(plt.Rectangle((px0, top - row * (len(order) - 0.4)), pw, row * len(order), facecolor="white",
                                edgecolor=INK, linewidth=1.2, zorder=8))
@@ -1840,14 +1845,14 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         ax.text(px0 + pw * 0.13, y, names.get(l, l).split("  ", 1)[-1], fontproperties=font(15), color=INK,
                 va="center", zorder=9)
     # key: stop, one-way stop, extension
-    ky = top - row * (len(order) - 0.4) - row * 0.9
+    ky = top - row * (len(order) - 0.4) - row * 0.8
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
     key_rows = [("dot", "przystanek"), ("arrow", "przystanek w jednym kierunku jazdy"),
                 ("dash", "wydłużenia: mniej niż 1/4 kursów linii"),
                 ("diamond", "koniec wydłużenia, obok: kursów linii na dobę")]
     kl = lw * 2.2                                   # key drawn larger than on the map, to be legible
     for k, (kind, text) in enumerate(key_rows):
-        y = ky - k * row * 0.75
+        y = ky - k * row * 0.68
         xm = (kx0 + kx1) / 2
         if kind == "diamond":
             ax.scatter([xm - (kx1 - kx0) * 0.18], [y], marker="D", s=21 ** 2, color="#8a8a8a", zorder=9.5,
