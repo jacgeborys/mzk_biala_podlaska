@@ -16,6 +16,7 @@ zoomed to the city limits.
 Usage:  python diagram.py [--date 20261118] [--out png/bus_network_city.png] [--seed 1]
 """
 import argparse
+import copy
 import json
 import math
 import random
@@ -53,6 +54,7 @@ SIMPLIFY_M = 30     # sections are simplified this much before their corners are
 CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
 EXACT_TURNS = True    # a lane that would fold at a tight junction corner is redrawn lane to lane (exact_turns)
 LANE_CHANGE_SIDE = False  # lane changes at a junction on the side with fewer lines (off: centred; it pushed G under E on al. Tysiąclecia)
+SPUR_RAMP_M = 300   # lane changes onto / off the Dworzec PKP spur (--station spur) ease over this length
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
@@ -61,7 +63,7 @@ EXT_SHARE = 0.5     # where a line runs with under this share of its trips of th
 # Dworzec PKP: the U hangs below the Sidorska / Al. 1000-lecia crossing as deep as its parts need
 # (U_TOP_M + S-bend + U_HALF_M, 582 m; was 690 with a 285-300 m straight top)
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
-STATION_STYLE = "u"     # Dworzec PKP: u / untangle / under / spur / box (--station; see station_access)
+STATION_STYLE = "spur"  # Dworzec PKP: u / untangle / under / spur / box (--station; user chose spur, 2026-11-17)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 260        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
@@ -792,39 +794,48 @@ def station_access(edges, stations):
             # radius); the lines to Kościuszki go round the outside of the hairpins and on east. Centrelines run
             # RHO either side of the boundary (a jog of RHO at the top), the lanes put in place by shift_prof.
             RHO = SPACING / 2
+            GAP = SPACING / 2                      # innermost hairpin: radius one lane (half a lane looked filled)
             O_ = P0 + dv * U_TOP_M                                       # hairpin centre, on the boundary
             Sx = O_ + dv * RHO
             C = O_
             jog = 60.0
 
             def spur_leg(sign):
-                top = [P0, P0 + dv * jog + sign * perp * RHO]
+                # one straight from the crossing to the hairpin (RHO sideways over its length: no jog)
+                top = [P0]
                 straight = [O_ + sign * perp * RHO]
                 arc = [O_ + sign * perp * RHO * math.cos(a) + dv * RHO * math.sin(a)
                        for a in np.linspace(0, math.pi / 2, 7)[1:]]
                 return [tuple(p) for p in top + straight + arc]
             lg = spur_leg(-1)
             sh_top_L = -nL * SPACING / 2                  # left of travel (down: east +): lanes west of the boundary
-            lprof = [sh_top_L] + [sh_top_L + RHO] * (len(lg) - 1)
+            lprof = [sh_top_L + RHO - GAP] * len(lg)
             keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
                              twin_side=-1, trips=tr(down), shift_prof=lprof, schematic=Point(xy), down_dir=dv))
             if u_lines:
                 rg = spur_leg(1)
                 sh_top_R = -nR * SPACING / 2              # left of travel (up: west +): lanes east of the boundary
-                rprof = [sh_top_R] + [sh_top_R + RHO] * (len(rg) - 1)
+                rprof = [sh_top_R + RHO - GAP] * len(rg)
                 keep.append(dict(geom=LineString([tuple(Sx)] + rg[::-1][1:-1] + [N2]), lines=u_lines, u=key(Sx),
                                  v=N2, raw=True, twin_side=-1, trips=tr(u_lines), shift_prof=rprof[::-1],
                                  schematic=Point(xy), down_dir=dv))
             if kos_lines:
                 kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
                 corner = thr_c[kc]
-                turn = Sx + perp * max(float(np.dot(corner - Sx, perp)), 250.0)
-                kg = [tuple(Sx), tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1]
-                kg = [tuple(Sx)] + list(LineString(kg[1:]).simplify(SIMPLIFY_M).coords)   # drawn as is (raw)
-                # outside the hairpins: the outermost (u_lines) lanes reach (nL - 0.5) lanes below the centre
-                ksh = -(len(u_lines) + len(kos_lines) / 2) * SPACING + RHO
+                Lk = max(float(np.dot(corner - Sx, perp)), 520.0)
+                turn = Sx + perp * Lk
+                # outside the hairpins: the outermost (u_lines) lanes reach (nL - 0.5) lanes below the centre; past
+                # the hairpins (RAMP_A on) they rise gently to the street, before the corner north
+                ksh = -(len(u_lines) + len(kos_lines) / 2) * SPACING + RHO - GAP
+                ra, rb = (len(u_lines) + 2) * SPACING, Lk - 220
+                ramp = [Sx + perp * (ra + (rb - ra) * f) for f in np.linspace(0, 1, 9)]
+                rest = list(LineString([tuple(turn)] + [tuple(p) for p in thr_c[kc:0:-1]] + [N1])
+                            .simplify(SIMPLIFY_M).coords)
+                kg = [tuple(Sx)] + [tuple(p) for p in ramp] + rest                       # drawn as is (raw)
+                ss_ = lambda t: t * t * (3 - 2 * t)  # noqa: E731
+                kprof = [ksh, ksh] + [ksh * (1 - ss_(f)) for f in np.linspace(0, 1, 9)[1:]] + [0.0] * len(rest)
                 keep.append(dict(geom=LineString(kg), lines=kos_lines, u=key(Sx), v=N1, trips=tr(kos_lines), raw=True,
-                                 shift_prof=[ksh, ksh] + [0.0] * (len(kg) - 2),
+                                 shift_prof=kprof,
                                  schematic=LineString(thr_c).interpolate(0.5, normalized=True)))
                 kos_g = keep[-1]["geom"]
                 for st in stations.values():
@@ -1097,6 +1108,40 @@ def best_orders(lines, edges, seed, iters=60000):
 
 
 # ---------------------------------------------------------------- 5: drawing geometry
+STATION_REORDER_M = 900   # --station other than u: sections this close to the station crossing are re-ordered
+
+
+def refine_orders(edges, orders, only, seed, iters=20000):
+    """Annealing of the line orders of the sections `only` (the rest kept), starting from `orders`."""
+    nodes = node_passes(edges)
+    orders = [o[:] for o in orders]
+    ends = [(e["u"], e["v"]) for e in edges]
+    cost_at = {n: node_cost(inc, orders, edges, n) for n, inc in nodes.items()}
+    multi = [i for i in only if len(orders[i]) > 1]
+    if not multi:
+        return orders
+    rnd = random.Random(seed + 11)
+    cur = sum(cost_at.values())
+    best, best_c = [o[:] for o in orders], cur
+    for it in range(iters):
+        i = rnd.choice(multi)
+        a_, b_ = rnd.sample(range(len(orders[i])), 2)
+        orders[i][a_], orders[i][b_] = orders[i][b_], orders[i][a_]
+        touched = set(ends[i])
+        new = {n: node_cost(nodes[n], orders, edges, n) for n in touched}
+        delta = sum(new[n] - cost_at[n] for n in touched)
+        T = 0.5 * (1 - it / iters) + 1e-3
+        if delta <= 0 or rnd.random() < math.exp(-delta / T):
+            cost_at.update(new)
+            cur += delta
+            if cur < best_c - 1e-9:
+                best, best_c = [o[:] for o in orders], cur
+        else:
+            orders[i][a_], orders[i][b_] = orders[i][b_], orders[i][a_]
+    print(f"line order near the station re-searched ({len(multi)} sections): cost {best_c:.1f}")
+    return best
+
+
 def lane(orders, i, l):
     ls = orders[i]
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING + LANE_SHIFT.get(i, 0.0)
@@ -1831,7 +1876,12 @@ def draw_path(seq, l, edges, orders):
         else:                                         # joining: take the new lane a little before it
             sel = (ds < ds[j]) & (ds >= max(ds[j] - half, lo_))
             O2[sel] = O[j]
+    # lanes spreading from the incoming bundle onto the dead-end spur's legs ease over a longer stretch
     O = smooth(O2[:, None], RAMP_M)[:, 0]
+    if U_INFO.get("spur") and any("down_dir" in edges[i] for i, _ in seq):    # only near the spur's top
+        d_ = np.hypot(*(Q - np.array(U_INFO["node"])).T)
+        w_ = np.clip((450 - d_) / 150, 0, 1)
+        O = O * (1 - w_) + smooth(O2[:, None], SPUR_RAMP_M)[:, 0] * w_
     t = np.gradient(Q, axis=0)
     t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
@@ -1960,6 +2010,10 @@ def u_turns(seq, l, edges, orders, c, E, Q):
             p1 = np.array(N2) - d1 * min(U_ARM_LEAD_M, 0.5 * seg_a) + np.array([-d1[1], d1[0]]) * a_l
             cand1 = [k for k in range(0, j) if E[k] == arm]
             i1 = min(cand1, key=lambda k: np.hypot(*(c[k] - p1))) if cand1 else -1
+            if 4 <= i1 and np.hypot(*(c[i1] - p1)) < 15:
+                p1 = c[i1].copy()                          # join the arm exactly as drawn there
+                d1 = c[i1] - c[i1 - 4]
+                d1 = d1 / max(np.hypot(*d1), 1e-9)
             # the leg's lane, exactly: its straight top (U_TOP_M from the crossing), line l's lane on it
             gl = np.array(edges[leg]["geom"].coords)
             down_u = edges[leg]["u"] == N2                         # left leg: drawn from the crossing down
@@ -2223,6 +2277,10 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     paths = defaultdict(list)                     # line -> drawn LineStrings
     line_ends = []                                # (line, end point, direction pointing out of the line)
     spots = station_spots(stations, edges)
+    if U_INFO.get("spur"):                       # the station line across the spur's bottom: radially, down
+        for k_, (i_, b_, t_, ls_) in list(spots.items()):
+            if stations[k_]["name"] in KEY_STATIONS:
+                spots[k_] = (U_INFO["left"], b_, U_INFO["perp"], ls_)
     hold_lanes(edges, orders, stations, spots)
     hold_inner_lanes(edges, orders)
     compute_tl_caps(edges, orders)
@@ -2590,6 +2648,10 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                     ax.scatter([p[0]], [p[1]], s=(lw * 0.7) ** 2, color=INK, zorder=4, linewidths=0)
             continue
         pts_ = [p for p in (on_line(l, base) for l in edges[i]["lines"]) if p is not None] + term_cut.get(sid, [])
+        if key_st and U_INFO.get("spur"):          # the spur's bottom: every lane crossing the line down from it
+            O_c = U_INFO["Sx"] - U_INFO["dv"] * SPACING
+            pts_ = [q for l, _, _, _, c, _, _ in chains if l in edges[i]["lines"]
+                    for _, q in crossings(c, O_c, t) if 0 < (q - O_c) @ U_INFO["dv"] < 300]
         if not pts_:
             continue
         side = [float(np.dot(p - base, nrm)) for p in pts_]
@@ -2744,10 +2806,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             w_m = max(w_m, bullet_w(bullets, trips) * m_per_pt)
             h_m += 17 * m_per_pt
         best = None
-        for ang in range(0, 360, 22):
+        spur_name = U_INFO.get("spur") and name in KEY_STATIONS     # under the spur, off its lines
+        for ang in (range(200, 341, 10) if spur_name else range(0, 360, 22)):
             v = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
             first = None
-            for dist in np.arange(0, 200, 5.0):
+            for dist in np.arange(0, 320 if spur_name else 200, 5.0):
                 if first is not None and dist > first + 40:
                     break                                  # at most 40 m past the closest clear spot
                 anchor = base + v * dist
@@ -2883,15 +2946,33 @@ def main():
                                    [s["xy"] for s in stations.values() if s["name"] in KEY_STATIONS])
     edges = fold_parallel(contract_short(repair_lines(edges, geoms, line_of)))
     edges = drop_turning_stubs(edges, stations)
-    edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
-    hairpin_tips(edges, stations)
-    drop_duplicate_sections(edges)
-    print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
+    edges = edge_trips(edges, geoms, n_shape, line_of)
     shapes = defaultdict(list)                   # line -> [(shape, trips of the day)]
     for sid, g in geoms.items():
         shapes[line_of[sid]].append((g, int(n_shape[sid])))
+    base_orders = None
+    if STATION_STYLE != "u":
+        # line orders away from the station as with the U (the layout the user approved): the order search is
+        # run on the U first, then only the sections near the station are searched again for this style
+        style, cw = STATION_STYLE, (STATION_CROSS_W, ABOVE_CROSS_W)
+        STATION_STYLE, (STATION_CROSS_W, ABOVE_CROSS_W) = "u", (0.3, 3.0)
+        e_u = station_access(copy.deepcopy(edges), copy.deepcopy(stations))
+        drop_duplicate_sections(e_u)
+        set_joins(e_u, shapes)
+        base_orders = best_orders(sorted(line_trips.index), e_u, args.seed)
+        for d_ in (PAIRS, NODE_W, U_INFO, LANE_SHIFT, JOINS):
+            d_.clear()
+        STATION_STYLE, (STATION_CROSS_W, ABOVE_CROSS_W) = style, cw
+    edges = station_access(edges, stations)
+    hairpin_tips(edges, stations)
+    drop_duplicate_sections(edges)
+    print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     set_joins(edges, shapes)
-    orders = best_orders(sorted(line_trips.index), edges, args.seed)
+    if base_orders is not None and len(base_orders) == len(edges) and             all(set(o) == set(e["lines"]) for o, e in zip(base_orders, edges)):
+        near = {i for i, e in enumerate(edges) if e["geom"].distance(Point(U_INFO["node"])) < STATION_REORDER_M}
+        orders = refine_orders(edges, base_orders, near, args.seed)
+    else:
+        orders = best_orders(sorted(line_trips.index), edges, args.seed)
     arm_shifts(edges, orders)
     relax_junction_corners(edges, orders)
     rebuild_hugs(edges, orders)
