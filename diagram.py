@@ -835,8 +835,11 @@ def chain_node(step, edges, start):
     return (e["u"] if fwd else e["v"]) if start else (e["v"] if fwd else e["u"])
 
 
-def lead_in(l, node, i, edges, inc_l, before):
-    """Line l's straightest continuation through node from section i, as a chain step (None if l ends there)."""
+def lead_in(l, node, i, edges, inc_l, before, shapes=()):
+    """Line l's continuation through node from section i, as a chain step (None if l ends there): the section its
+    buses really drive on to / come from (shapes passing both within 40 m of the node, one right after the other,
+    weighted by trips; e.g. E from Daleka north into Wolska, not the straighter Daleka south), else the
+    straightest."""
     others = [j for j in inc_l[(l, node)] if j != i]
     if not others:
         return None
@@ -847,8 +850,20 @@ def lead_in(l, node, i, edges, inc_l, before):
     def away(j):
         g = edges[j]["geom"]
         return heading_at(g, 0) if edges[j]["u"] == node else heading_at(g, g.length) + math.pi
+    def near(j):
+        g = edges[j]["geom"]
+        d = min(40.0, g.length / 2)
+        return g.interpolate(d if edges[j]["u"] == node else g.length - d)
+    qi = near(i)
+    score = {}
+    for j in others:
+        qj = near(j)
+        for g, n in shapes:
+            if g.distance(qi) < TOL and g.distance(qj) < TOL and abs(g.project(qi) - g.project(qj)) < 200:
+                score[j] = score.get(j, 0) + n
     h = away(i)
-    j = min(others, key=lambda j: abs((away(j) - h - math.pi + math.pi) % (2 * math.pi) - math.pi))
+    straight = lambda j: abs((away(j) - h - math.pi + math.pi) % (2 * math.pi) - math.pi)  # noqa: E731
+    j = min(others, key=lambda j: (-score.get(j, 0), straight(j)))
     return (j, edges[j]["v"] == node) if before else (j, edges[j]["u"] == node)
 
 
@@ -1024,8 +1039,8 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         for seq in chain_seqs(l, edges):
             # a chain ending at a junction where the line goes on along other sections (a branch, a crossing of its
             # own) is drawn with a lead-in of its straightest continuation: it eases out of that lane, no gap
-            pre = lead_in(l, chain_node(seq[0], edges, True), seq[0][0], edges, inc_l, True)
-            post = lead_in(l, chain_node(seq[-1], edges, False), seq[-1][0], edges, inc_l, False)
+            pre = lead_in(l, chain_node(seq[0], edges, True), seq[0][0], edges, inc_l, True, shapes.get(l, []))
+            post = lead_in(l, chain_node(seq[-1], edges, False), seq[-1][0], edges, inc_l, False, shapes.get(l, []))
             own = {i for i, _ in seq}
             pre = pre if pre and pre[0] not in own else None
             post = post if post and post[0] not in own and (not pre or post[0] != pre[0]) else None
