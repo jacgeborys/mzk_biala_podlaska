@@ -54,6 +54,7 @@ CORNER_R = 150      # m: corners become circular arcs of this radius (smaller wh
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
+DASH_ON, DASH_OFF = 4.0, 0.55   # extensions: dash / gap length in line widths
 EXT_SHARE = 0.25    # where a line runs with under this share of its trips of the day it is an extension (dashed)
 U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
@@ -69,6 +70,8 @@ CONNECT_M = 500     # a line broken into pieces is joined along the corridors if
 DROP_M = 150        # pieces of a line shorter than this that cannot be joined are dropped (strays)
 END_JOIN_M = 400    # a loose end of a line inside the network continues this far at most to reach the line again
 PAIR_M = 80         # two loose ends of one line this close are bridged
+SNAP_M = 10         # corridor ends this close are linked before lines are repaired (gaps closed in place)
+RB_MARGIN_M = 10    # roundabouts: edges cut this far outside the ring and joined straight to one node
 STUB_M = 150        # dead-end bits of a line this short that do not end where its routes end are dropped
 FONT = Path("C:/Windows/Fonts/bahnschrift.ttf")
 LAND, WATER, GREEN, INK = "#f5f2ea", "#a9cde6", "#d9e8cf", "#1d1d1f"
@@ -195,10 +198,14 @@ def lines_on(pieces, geoms, line_of, step=10.0):
 
 def build_edges(pieces, sets):
     key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
-    edges = {}
-    for i, (p, s) in enumerate(zip(pieces, sets)):
-        if s:
-            edges[i] = dict(geom=p, lines=frozenset(s), u=key(p.coords[0]), v=key(p.coords[-1]))
+    return chain_edges([dict(geom=p, lines=frozenset(s), u=key(p.coords[0]), v=key(p.coords[-1]))
+                        for p, s in zip(pieces, sets) if s])
+
+
+def chain_edges(edge_list):
+    """Edges with the same lines chained through nodes of degree 2."""
+    key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
+    edges = dict(enumerate(edge_list))
     changed = True
     while changed:  # chain pieces with the same lines through nodes of degree 2
         changed = False
@@ -225,6 +232,18 @@ def repair_lines(edges, geoms, line_of):
     corridor the membership test missed are joined (shortest corridor path, CONNECT_M), short unjoinable strays
     and dead-end stubs that are not route ends are dropped."""
     import networkx as nx
+    # corridor ends a few metres apart that do not touch (a cut-end link landing next to a node) are linked
+    # first, so a gap there is closed in place and not by a detour along another street
+    edges = list(edges)
+    ends = sorted({n for e in edges for n in (e["u"], e["v"])})
+    tree = STRtree([Point(n) for n in ends])
+    linked = {frozenset((e["u"], e["v"])) for e in edges}
+    for a in ends:
+        for k in tree.query(Point(a).buffer(SNAP_M)):
+            b = ends[k]
+            if b != a and frozenset((a, b)) not in linked and Point(a).distance(Point(b)) <= SNAP_M:
+                linked.add(frozenset((a, b)))
+                edges.append(dict(geom=LineString([a, b]), lines=frozenset(), u=a, v=b))
     G = nx.Graph()
     for i, e in enumerate(edges):
         if not G.has_edge(e["u"], e["v"]) or G[e["u"]][e["v"]]["w"] > e["geom"].length:
@@ -343,6 +362,80 @@ def contract_short(edges, min_len=None):
     return out
 
 
+def straighten_roundabouts(edges, keep_near=()):
+    """Every OSM roundabout the network touches becomes one node (as in cartogram.py): edges are cut RB_MARGIN_M
+    outside the ring and joined by straight spokes to the line-weighted mean of the cut points; the ring itself
+    goes. Then edges left running between the same two nodes (a frontage road beside the main carriageway, two
+    carriageways into the ring, e.g. at Białka) are folded into one (fold_parallel). Roundabouts within
+    800 m of a point in keep_near are left alone (Dworzec PKP: its schematic needs the real junctions)."""
+    from cartogram import roundabouts
+    key = lambda c: (round(c[0], 1), round(c[1], 1))  # noqa: E731
+    n = 0
+    for c, r in roundabouts():
+        R = r + RB_MARGIN_M
+        if not any(e["geom"].distance(c) < R for e in edges):
+            continue
+        if any(Point(s).distance(c) < 800 for s in keep_near):
+            continue
+        n += 1
+        disk = c.buffer(R)
+        out, cut = [], []
+        for e in edges:
+            if e["geom"].distance(c) >= R:
+                out.append(e)
+                continue
+            for g in parts(e["geom"].difference(disk)):
+                xy = list(g.coords)
+                ends = [Point(xy[0]).distance(c) < R + 0.5, Point(xy[-1]).distance(c) < R + 0.5]
+                cut += [(xy[0] if k == 0 else xy[-1], len(e["lines"])) for k in (0, 1) if ends[k]]
+                out.append((e, xy, ends))
+        if not cut:
+            edges = [o for o in out if isinstance(o, dict)]
+            continue
+        w = np.array([t for _, t in cut], float)
+        m = tuple(np.round((np.array([xy for xy, _ in cut]) * w[:, None]).sum(axis=0) / w.sum(), 1))
+        res = []
+        for o in out:
+            if isinstance(o, dict):
+                res.append(o)
+                continue
+            e, xy, ends = o
+            xy = ([m] if ends[0] else []) + xy + ([m] if ends[1] else [])
+            res.append(dict(geom=LineString(xy), lines=e["lines"], u=key(xy[0]), v=key(xy[-1])))
+        edges = res
+    print(f"roundabouts straightened: {n}")
+    return fold_parallel(edges)
+
+
+def fold_parallel(edges):
+    """Edges between the same two junctions with lengths within 1.5x (+50 m) of each other (two carriageways, a
+    frontage road beside the main road, both approaches to a straightened roundabout) become one corridor: the
+    one with more lines (then the shorter) carrying the lines of both. A detour much longer than the direct edge
+    (the Dworzec PKP spur vs Sidorska) is kept apart."""
+    by_ends = defaultdict(list)
+    out = []
+    for e in edges:
+        if e["u"] == e["v"]:
+            out.append(e)
+        else:
+            by_ends[frozenset((e["u"], e["v"]))].append(e)
+    folded = 0
+    for es in by_ends.values():
+        es = sorted(es, key=lambda e: (-len(e["lines"]), e["geom"].length))
+        keep = [es[0]]
+        for e in es[1:]:
+            a_, b_ = sorted((e["geom"].length, keep[0]["geom"].length))
+            if b_ < 1.5 * a_ + 50:
+                keep[0] = dict(keep[0], lines=keep[0]["lines"] | e["lines"])
+                folded += 1
+            else:
+                keep.append(e)
+        out += keep
+    if folded:
+        print(f"parallel edges folded: {folded}")
+    return chain_edges(out)
+
+
 def edge_trips(edges, geoms, n_shape, line_of):
     """Trips of the day per line along every edge (shapes running along it, TOL m): e["trips"] = {line: n}."""
     for e in edges:
@@ -439,25 +532,25 @@ def station_access(edges, stations):
         for k_ in sts:
             stations[k_]["xy"] = Sx - perp * 1.0                     # on the leg every line uses
         out = keep
-        # how A / C / I pair their four sections at the crossing: the right leg with Al. 1000-lecia north, the left
-        # leg with the other arm (A: Sidorska east, C, I: Sidorska west). Of the four ways round this one has the
-        # fewest crossings along Al. 1000-lecia in all (2 at the crossing + 10 counted at the station)
+        # how A / C / I pair their four sections at the crossing: by side, the more westerly arm with the west leg,
+        # the other with the east leg, so no line crosses itself there (C, I: Sidorska west + west leg, Al.
+        # 1000-lecia north + east leg; A: Al. 1000-lecia north + west leg, Sidorska east + east leg)
         idx = {id(f): k for k, f in enumerate(out)}
         left_k = idx[id(next(f for f in out if f.get("raw") and f["u"] == N2))]
         right_k = next((idx[id(f)] for f in out if f.get("raw") and f["v"] == N2), None)
 
-        def south(k):
+        def east(k):
             g_ = out[k]["geom"]
             d_ = min(60, g_.length / 2)
             q = g_.interpolate(d_ if out[k]["u"] == N2 else g_.length - d_)
-            return float(np.dot(np.array(q.coords[0]) - P0, dv))
+            return float(np.dot(np.array(q.coords[0]) - P0, perp))
         for l in u_lines:
             arms = [k for k, f in enumerate(out) if l in f["lines"] and N2 in (f["u"], f["v"])
                     and k not in (left_k, right_k)]
             if len(arms) != 2 or right_k is None:
                 continue
-            n_arm, o_arm = sorted(arms, key=south)
-            PAIRS[(l, N2)] = {right_k: n_arm, n_arm: right_k, left_k: o_arm, o_arm: left_k}
+            w_arm, e_arm = sorted(arms, key=east)
+            PAIRS[(l, N2)] = {left_k: w_arm, w_arm: left_k, right_k: e_arm, e_arm: right_k}
         NODE_W[key(Sx)] = STATION_CROSS_W
         NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
@@ -898,7 +991,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                     continue
                 if ext[a_]:
                     ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, dash_capstyle="butt",
-                            linestyle=(0, (1.6, 0.9)), zorder=3)
+                            linestyle=(0, (DASH_ON, DASH_OFF)), zorder=3)
                 else:
                     ax.plot(part[:, 0], part[:, 1], color=colors.get(l, "#888"), lw=lw, solid_capstyle="butt",
                             solid_joinstyle="round", zorder=3)
@@ -1075,7 +1168,9 @@ def main():
     geoms, n_shape, line_of, stations, line_trips = load(args.date)
     pieces = corridors(geoms, n_shape, line_of, line_trips)
     sets = lines_on(pieces, geoms, line_of)
-    edges = contract_short(repair_lines(build_edges(pieces, sets), geoms, line_of))
+    edges = straighten_roundabouts(build_edges(pieces, sets),
+                                   [s["xy"] for s in stations.values() if s["name"] in KEY_STATIONS])
+    edges = fold_parallel(contract_short(repair_lines(edges, geoms, line_of)))
     edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
