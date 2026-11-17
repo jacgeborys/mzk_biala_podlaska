@@ -55,7 +55,7 @@ RAMP_M = 120        # a line changing lane at a junction eases over this length 
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
 DASH_ON, DASH_OFF = 4.0, 0.55   # extensions: dash / gap length in line widths
-EXT_SHARE = 0.25    # where a line runs with under this share of its trips of the day it is an extension (dashed)
+EXT_SHARE = 0.5     # where a line runs with under this share of its trips of the day it is an extension (pale)
 U_DEPTH_M = 690      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
@@ -70,7 +70,7 @@ TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoi
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
-MAIN_TERMINUS = 0.25              # a station is a line's terminus when this share of its trips start or end there (= EXT_SHARE)
+MAIN_TERMINUS = 0.25              # a station is a line's terminus when this share of its trips start or end there
 CONNECT_M = 500     # a line broken into pieces is joined along the corridors if the gap is at most this long
 DROP_M = 150        # pieces of a line shorter than this that cannot be joined are dropped (strays)
 END_JOIN_M = 400    # a loose end of a line inside the network continues this far at most to reach the line again
@@ -1429,6 +1429,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     spots = station_spots(stations, edges)
     term_cut = defaultdict(list)                  # terminus station -> points where lines ending there were cut
     shifted = {}      # terminus station -> (station point moved along the road, tip: the peak of a side line's arc)
+    def pale_end(l, k):
+        """True if line l ending at station k ends on an extension: under EXT_SHARE of its trips call there (counted
+        at the stop, both directions: near a terminal loop one point sees only one direction)."""
+        return stations[k]["trips"].get(l, 0) < EXT_SHARE * line_trips[l]
+
     def trim_at_terminus(l, c, E, Q, at_end):
         """A line ending at one of its main termini is cut where it crosses the station (the line through the
         stop across the bundle), so every line ending there stops flush at the station capsule instead of
@@ -1440,6 +1445,8 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         if not cand:
             return c, E, Q, None
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))
+        if pale_end(l, k):                        # a pale end (an extension): diamond, not cut at a capsule
+            return c, E, Q, None
         _, base, t, _ = spots[k]
         if k in shifted:                          # the station line moved to the arc's peak, level (see below)
             base, _, t = shifted[k]
@@ -1692,7 +1699,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         # no end mark where the line turns at Dworzec PKP (it gets its own capsule)
         if any(s_["name"] in KEY_STATIONS and np.hypot(*(s_["xy"] - xy)) < 80 for s_ in stations.values()):
             continue
-        if k is not None and l in stations[k]["term"]:
+        if k is not None and l in stations[k]["term"] and not pale_end(l, k):
             nrm = np.array([-d[1], d[0]])
             capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
         else:
@@ -1753,7 +1760,8 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             capsule(a_, b_)
         zone = LineString([a_, b_]).buffer(cap_r + 5)
         main = st_["term"]                           # real termini only (B only visits Dworzec PKP, in and out)
-        bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()) - main)]
+        main = main - var_end.get(sid, set())        # a line ending here on a pale extension: diamond
+        bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()))]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
     def bullet_w(bullets, sid):
@@ -1848,7 +1856,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     ky = top - row * (len(order) - 0.4) - row * 0.8
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
     key_rows = [("dot", "przystanek"), ("arrow", "przystanek w jednym kierunku jazdy"),
-                ("dash", "wydłużenia: mniej niż 1/4 kursów linii"),
+                ("dash", "wydłużenia: mniej niż połowa kursów linii"),
                 ("diamond", "koniec wydłużenia, obok: kursów linii na dobę")]
     kl = lw * 2.2                                   # key drawn larger than on the map, to be legible
     for k, (kind, text) in enumerate(key_rows):
