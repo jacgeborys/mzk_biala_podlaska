@@ -64,8 +64,7 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
-TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are terminal turning loops ...
-TURN_DUMMY_M = 220  # ... drawn as a straight dummy street this long (which lines turn in stays readable)
+TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -515,31 +514,24 @@ def _fold_once(edges):
 
 def drop_turning_stubs(edges, stations):
     """Short dead-end stubs (< TURN_STUB_M) whose stop lies nearer their junction than their dead end are the
-    terminal turning loop (Terebelska Pętla: 55 m, stop 23 m from the junction, all six lines ending there turn
-    into it). Drawn as a dummy straight street of TURN_DUMMY_M in the stub's direction with the stop moved near
-    its end, so the lines that turn in are seen to turn and end flush at the capsule there, instead of a stub too
-    short to read. A spur with its stop out at the end (Cmentarz Komunalny, 101 m) stays as it is."""
+    terminal turning manoeuvre, not a route: dropped, so the lines end on the through road at the junction and are
+    cut flush at the station capsule there (Terebelska Pętla: a 55 m stub across the end of the trunk, stop 23 m
+    from the junction). A spur with its stop out at the end (Cmentarz Komunalny, 101 m) stays."""
     deg = defaultdict(int)
     for e in edges:
         deg[e["u"]] += 1
         deg[e["v"]] += 1
+    pts = [Point(s["xy"]) for s in stations.values()]
     out, n = [], 0
     for e in edges:
         if e["geom"].length < TURN_STUB_M and (deg[e["u"]] == 1) != (deg[e["v"]] == 1):
             dead, junc = (e["u"], e["v"]) if deg[e["u"]] == 1 else (e["v"], e["u"])
-            near = [k for k, s_ in stations.items() if Point(s_["xy"]).distance(e["geom"]) < 60]
-            if near and all(Point(stations[k]["xy"]).distance(Point(junc)) < Point(stations[k]["xy"]).distance(Point(dead))
-                            for k in near):
-                d_ = np.array(dead) - np.array(junc)
-                d_ /= np.hypot(*d_)
-                end = tuple(np.round(np.array(junc) + d_ * TURN_DUMMY_M, 1))
-                for k in near:
-                    stations[k]["xy"] = np.array(junc) + d_ * (TURN_DUMMY_M - 25)
-                out.append(dict(geom=LineString([junc, end]), lines=e["lines"], u=junc, v=end, dummy=True))
+            near = [p for p in pts if p.distance(e["geom"]) < 60]
+            if near and all(p.distance(Point(junc)) < p.distance(Point(dead)) for p in near):
                 n += 1
                 continue
         out.append(e)
-    print(f"terminal turning loops drawn as dummy streets: {n}")
+    print(f"terminal turning stubs dropped: {n}")
     return chain_edges(out)
 
 
@@ -1379,6 +1371,35 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     line_ends = []                                # (line, end point, direction pointing out of the line)
     spots = station_spots(stations, edges)
     term_cut = defaultdict(list)                  # terminus station -> points where lines ending there were cut
+    # a line ending at a terminus that comes in beside the bundle instead of along it (C at Terebelska Pętla, from
+    # Jana III Sobieskiego, passing just above the trunk) is taken into the capsule: the station line runs from the
+    # outermost lane on the other side to that line's lane, so the capsule tilts up to it; the lines ending there
+    # are cut flush along that tilted line
+    tilted = {}                                   # station -> (end a, end b, unit direction a -> b)
+    for k, (i, base, t, _) in spots.items():
+        extra = stations[k]["term"] - edges[i]["lines"]
+        if not extra:
+            continue
+        nrm = np.array([-t[1], t[0]])
+        offs = [lane(orders, i, l) for l in edges[i]["lines"]]
+        pa, pb = base + nrm * min(offs), base + nrm * max(offs)
+        mid = (min(offs) + max(offs)) / 2
+        for l in extra:
+            best = None
+            for j, e in enumerate(edges):
+                if l in e["lines"] and j in _SECTIONS and e["geom"].distance(Point(base)) < 200:
+                    g = LineString(_SECTIONS[j]).offset_curve(lane(orders, j, l))
+                    if not g.is_empty and (best is None or g.distance(Point(base)) < best[0]):
+                        best = (g.distance(Point(base)), np.array(g.interpolate(g.project(Point(base))).coords[0]))
+            if best is None or best[0] > 3 * SPACING + 60:
+                continue
+            q = best[1]
+            if float((q - base) @ nrm) >= mid:
+                pb = q
+            else:
+                pa = q
+        u = (pb - pa) / max(np.hypot(*(pb - pa)), 1e-9)
+        tilted[k] = (pa, pb, u)
 
     def trim_at_terminus(l, c, E, Q, at_end):
         """A line ending at one of its main termini is cut where it crosses the station (the line through the
@@ -1392,6 +1413,10 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             return c, E, Q, None
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))
         _, base, t, _ = spots[k]
+        if k in tilted:                           # cut along the tilted station line instead
+            pa, pb, u = tilted[k]
+            t2 = np.array([u[1], -u[0]])
+            t, base = (t2 if t2 @ t >= 0 else -t2), (pa + pb) / 2
         nrm = np.array([-t[1], t[0]])
         sgn = np.sign((c - base) @ t)
         idx = range(len(c) - 1, 0, -1) if at_end else range(0, len(c) - 1)
@@ -1585,10 +1610,14 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             continue
         side = [float(np.dot(p - base, nrm)) for p in pts_]
         lo, hi = min(side) - SPACING * 0.55, max(side) + SPACING * 0.55
-        if not any(n_ == base_name(st_["name"]) and np.hypot(*(b_ - base)) < 150 for n_, b_ in capsuled):
+        a_, b_ = base + nrm * lo, base + nrm * hi
+        if sid in tilted:                             # capsule along the tilted station line (see above)
+            pa, pb, u_ = tilted[sid]
+            a_, b_ = pa - u_ * SPACING * 0.55, pb + u_ * SPACING * 0.55
+        if not any(n_ == base_name(st_["name"]) and np.hypot(*(q_ - base)) < 150 for n_, q_ in capsuled):
             capsuled.add((base_name(st_["name"]), tuple(base)))
-            capsule(base + nrm * lo, base + nrm * hi)
-        zone = LineString([base + nrm * lo, base + nrm * hi]).buffer(cap_r + 5)
+            capsule(a_, b_)
+        zone = LineString([a_, b_]).buffer(cap_r + 5)
         main = st_["term"]                           # real termini only (B only visits Dworzec PKP, in and out)
         bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()) - main)]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
