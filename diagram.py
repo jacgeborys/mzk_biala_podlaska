@@ -64,7 +64,7 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
-CORNER_EASE = 0.4   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
+CORNER_EASE = 0.7   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
 TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
@@ -1100,7 +1100,28 @@ def relax_junction_corners(edges, orders):
                         changed = True
         if not changed:
             break
-    print(f"junction corners relaxed: {dropped} vertices dropped")
+    # a single line leaving a bundle at a junction: its first sharp street corner within 500 m is pulled
+    # CORNER_EASE of the way towards the chord of its neighbours, so it stays close to the bundle it left (G along
+    # Narutowicza: its corner onto al. Jana Pawła II, 456 m on, drew it far away from al. Tysiąclecia)
+    eased = 0
+    for k, e in enumerate(edges):
+        if len(e["lines"]) != 1 or e.get("raw") or k not in _SECTIONS:
+            continue
+        for n in (e["u"], e["v"]):
+            if len(at.get(n, [])) < 3 or max(len(edges[j]["lines"]) for j in at[n]) < 3:
+                continue
+            c_ = end(k, n)[::-1]                                   # starting at the junction
+            if len(c_) < 3:
+                continue
+            w1, w2 = c_[1] - c_[0], c_[2] - c_[1]
+            cv = np.dot(w1, w2) / (np.hypot(*w1) * np.hypot(*w2) + 1e-9)
+            if cv < math.cos(math.radians(45)) and np.hypot(*w1) < 500:
+                c2 = c_.copy()
+                c2[1] = c_[1] + CORNER_EASE * ((c_[0] + c_[2]) / 2 - c_[1])
+                c2 = c2[::-1]
+                _SECTIONS[k] = c2 if np.hypot(*(c2[-1] - np.array(n))) <= np.hypot(*(c2[0] - np.array(n)))                     and np.array_equal(end(k, n)[-1], _SECTIONS[k][-1]) else c2[::-1]
+                eased += 1
+    print(f"junction corners relaxed: {dropped} vertices dropped, {eased} single-line corners eased")
 
 
 def set_joins(edges, shapes):
