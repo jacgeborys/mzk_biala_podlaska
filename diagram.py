@@ -84,6 +84,31 @@ LAND, WATER, GREEN, INK = "#f5f2ea", "#a9cde6", "#d9e8cf", "#1d1d1f"
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
 
 
+LINE_ENDS = {}      # line -> {terminus name: trip starts + ends}, for the legend
+EXT_MIN_ENDS = 3    # legend: variant ends with fewer trip starts + ends are not listed
+
+
+def clean_stop(n):
+    """Stop name for the legend: no post number, no 'Pętla', no notes in brackets."""
+    return re.sub(r"\s+", " ", re.sub(r"\bPętla\b|\(.*?\)|\s\d+\b", "", n)).strip(" -")
+
+
+def legend_name(l, fallback):
+    """(main, extensions): the two termini with most trip starts + ends, then the other variant ends."""
+    ends = sorted(LINE_ENDS.get(l, {}).items(), key=lambda kv: -kv[1])
+    if not ends:
+        return fallback, ""
+    if len(ends) == 1:                              # a circular line (L): one terminus
+        return f"{ends[0][0]} (okrężna)", fallback.split("  ", 1)[-1].replace(" – ", ", ")
+    main = f"{ends[0][0]} – {ends[1][0]}"
+    ext = [n for n, c in ends[2:] if c >= EXT_MIN_ENDS]
+    txt = ("też: " + ", ".join(ext)) if ext else ""
+    while len(txt) > 64 and len(ext) > 1:                 # fits the legend panel; the rarest are left out
+        ext = ext[:-1]
+        txt = "też: " + ", ".join(ext) + " …"
+    return main, txt
+
+
 def font(size):
     if FONT.exists():
         return font_manager.FontProperties(fname=str(FONT), size=size)
@@ -141,6 +166,9 @@ def load(date):
         term = {l for l in lines if ends.get((sid_, l), 0) >= MAIN_TERMINUS * line_trips[l]}
         stations[sid_] = dict(name=name, xy=np.array([x, y]), lines=lines, term=term,
                               trips={l: int(calls.get((sid_, l), 0)) for l in lines})
+    first_last["nm"] = first_last.stop_id.map(stops.set_index("stop_id").stop_name).map(clean_stop)
+    for l, g in first_last.groupby("route_id"):
+        LINE_ENDS[l] = g.nm.value_counts().to_dict()        # trip starts + ends per terminus name
     return geoms, n_shape, line_of, stations, line_trips
 
 
@@ -513,6 +541,53 @@ def _fold_once(edges):
                 keep.append(e)
         out += keep
     return chain_edges(out), folded
+
+
+HAIRPINS = {"G": "Narutowicza"}   # line -> stop at the tip of its hairpin next to a junction (drawn tight)
+HAIRPIN_APPROACH_M = 400
+HAIRPIN_GAP = 2.0      # the tip stays this many lanes outside the widest bundle at the junction
+
+
+def hairpin_tips(edges, stations):
+    """A single line that runs past a junction on a parallel street and comes back into it in a hairpin, with a stop
+    on the way back (G at Narutowicza: north up the street east of al. Tysiąclecia, back WSW through the stop into
+    the Narutowicza junction): the hairpin is drawn tight, its tip at the stop, so the stop reads as a short walk
+    from the junction. Geometry fixed here (raw), not simplified or eased later."""
+    for l, name in HAIRPINS.items():
+        sts = [s_ for s_ in stations.values() if s_["name"] == name and l in s_["lines"]]
+        es = [k for k, e in enumerate(edges) if e["lines"] == frozenset(l) and not e.get("raw")]
+        if not sts or not es:
+            continue
+        S = Point(np.mean([s_["xy"] for s_ in sts], axis=0))
+        k = min(es, key=lambda k: edges[k]["geom"].distance(S))
+        e = edges[k]
+        if e["geom"].distance(S) > 60:
+            continue
+        c = section_coords(e, 1)
+        node = min((e["u"], e["v"]), key=lambda n: S.distance(Point(n)))
+        if np.hypot(*(c[0] - np.array(node))) < np.hypot(*(c[-1] - np.array(node))):
+            c = c[::-1]                                       # ... ending at the junction by the stop
+        turn = []
+        for j in range(1, len(c) - 1):
+            v1, v2 = c[j] - c[j - 1], c[j + 1] - c[j]
+            turn.append(math.acos(float(np.clip(v1 @ v2 / (np.hypot(*v1) * np.hypot(*v2) + 1e-9), -1, 1))))
+        j = int(np.argmax(turn)) + 1                          # the hairpin vertex
+        if turn[j - 1] < math.radians(90):
+            continue
+        leg = LineString([c[j], c[-1]])
+        T = np.array(leg.interpolate(leg.project(S)).coords[0])   # tip: the stop on the way back ...
+        half = max(len(f["lines"]) for f in edges if node in (f["u"], f["v"])) * SPACING / 2
+        dT = np.hypot(*(T - c[-1]))
+        T = c[-1] + (T - c[-1]) * min(1.0, (half + HAIRPIN_GAP * SPACING) / dT)   # ... pulled in near the bundle
+        u = (c[j] - c[j - 1]) / np.hypot(*(c[j] - c[j - 1]))
+        P = T - u * HAIRPIN_APPROACH_M                         # approach parallel to the real one
+        new = [tuple(p) for p in c[:j - 1]] + [tuple(P), tuple(T), tuple(c[-1])]
+        g = LineString(new)
+        edges[k] = dict(e, geom=g if tuple(np.round(new[0], 1)) == e["u"] or np.hypot(*(np.array(new[0]) - e["u"])) < 1
+                        else LineString(new[::-1]), raw=True)
+        for s_ in sts:
+            s_["xy"] = T                                      # the stop dot at the tip
+        print(f"hairpin {l} at {name}: tip {np.hypot(*(T - c[-1])):.0f} m from the junction")
 
 
 def drop_turning_stubs(edges, stations):
@@ -1850,8 +1925,13 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         y = top - k * row
         ax.scatter([px0 + pw * 0.06], [y], s=24 ** 2, color=colors.get(l, "#888"), zorder=9, linewidths=0)
         ax.text(px0 + pw * 0.06, y, l, fontproperties=font(14), color="white", ha="center", va="center", zorder=10)
-        ax.text(px0 + pw * 0.13, y, names.get(l, l).split("  ", 1)[-1], fontproperties=font(15), color=INK,
-                va="center", zorder=9)
+        main, ext = legend_name(l, names.get(l, l))
+        if ext:
+            ax.text(px0 + pw * 0.13, y + row * 0.13, main, fontproperties=font(15), color=INK, va="center", zorder=9)
+            ax.text(px0 + pw * 0.13, y - row * 0.22, ext, fontproperties=font(10.5), color="#777", va="center",
+                    zorder=9)
+        else:
+            ax.text(px0 + pw * 0.13, y, main, fontproperties=font(15), color=INK, va="center", zorder=9)
     # key: stop, one-way stop, extension
     ky = top - row * (len(order) - 0.4) - row * 0.8
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
@@ -1906,6 +1986,7 @@ def main():
     edges = fold_parallel(contract_short(repair_lines(edges, geoms, line_of)))
     edges = drop_turning_stubs(edges, stations)
     edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
+    hairpin_tips(edges, stations)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     shapes = defaultdict(list)                   # line -> [(shape, trips of the day)]
     for sid, g in geoms.items():
