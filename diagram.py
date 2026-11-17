@@ -58,11 +58,12 @@ EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension t
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
 DASH_ON, DASH_OFF = 4.0, 0.55   # extensions: dash / gap length in line widths
 EXT_SHARE = 0.5     # where a line runs with under this share of its trips of the day it is an extension (pale)
-U_DEPTH_M = 690      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
+# Dworzec PKP: the U hangs below the Sidorska / Al. 1000-lecia crossing as deep as its parts need
+# (U_TOP_M + S-bend + U_HALF_M, 582 m; was 690 with a 285-300 m straight top)
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
-U_TOP_M = 285        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
+U_TOP_M = 260        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
 U_ARM_ALL_M = 700    # ... arms shorter than this are shifted along their whole length (straight: Sidorska west, 604 m)
 U_S_R = 175          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
@@ -757,8 +758,11 @@ def station_access(edges, stations):
         tr = lambda ls: {l: trips.get(l, 0) for l in ls}  # noqa: E731
         # the U, drawn as is (no simplification): legs leave the crossing diagonally, run straight down, and
         # meet in a half circle whose lowest point is the station
-        C = P0 + dv * (U_DEPTH_M - U_HALF_M)
-        Sx = P0 + dv * U_DEPTH_M
+        phi = math.acos(1 - U_HALF_M / (2 * U_S_R))                   # S-bend: two arcs, U_HALF_M sideways
+        s_len = 2 * U_S_R * math.sin(phi)                             # ... over this length
+        depth = U_TOP_M + s_len + U_HALF_M          # no straight below the S-bend: the station as high as it fits
+        C = P0 + dv * (depth - U_HALF_M)
+        Sx = P0 + dv * depth
         ss = lambda t: t * t * (3 - 2 * t)  # noqa: E731
         down = u_lines | kos_lines | end_lines
 
@@ -780,8 +784,6 @@ def station_access(edges, stations):
             return [tuple(p) for p in [P0, P0 + dv * U_TOP_M] + ease_p + arc], prof
         keep = [f for k, f in enumerate(out) if k != i]
         nL, nR = len(down), len(u_lines)
-        phi = math.acos(1 - U_HALF_M / (2 * U_S_R))                   # S-bend: two arcs, U_HALF_M sideways
-        s_len = 2 * U_S_R * math.sin(phi)                             # ... over this length
         # shift: metres left of the edge's direction (left leg: down, so west is negative; right leg: up, so east
         # is negative)
         lg, lprof = leg(-1, -nR * SPACING / 2)
@@ -1739,6 +1741,22 @@ def draw_path(seq, l, edges, orders):
     half = RAMP_M / 2
     O2 = O.copy()
     bnd = [j for j in range(1, len(E)) if E[j] != E[j - 1]]
+    # an arm turning into a leg of the U (u_turns redraws that turn): its lane change happens on the arm, inside the
+    # redrawn stretch, so the leg is settled right below the crossing (its straight top is short)
+    if U_INFO:
+        legs = (U_INFO["left"], U_INFO["right"])
+        for j in bnd:
+            a_, b_ = E[j - 1], E[j]
+            if (a_ in legs) == (b_ in legs):
+                continue
+            arm = b_ if a_ in legs else a_
+            if not edges[arm].get("u_turn_arm"):
+                continue
+            ca_ = _SECTIONS[arm]
+            seg_a = float(np.hypot(*(ca_[-1] - ca_[-2]))) if edges[arm]["v"] == U_INFO["node"] else                 float(np.hypot(*(ca_[1] - ca_[0])))
+            reach = max(0.0, min(U_ARM_LEAD_M, 0.5 * seg_a) - 2 * RAMP_M)
+            sel = (E == arm) & (np.abs(ds - ds[j]) < reach)
+            O2[sel] = O[j] if b_ in legs else O[j - 1]
     for n_, j in enumerate(bnd):
         na, nb = len(edges[E[j - 1]]["lines"]), len(edges[E[j]]["lines"])
         if not LANE_CHANGE_SIDE or na == nb or O[j] == O[j - 1]:
@@ -1887,9 +1905,13 @@ def u_turns(seq, l, edges, orders, c, E, Q):
             d2 = d2 / np.hypot(*d2)
             pr_ = edges[leg]["shift_prof"]
             b_ = (lane(orders, leg, l) + pr_[0]) if down_u else -(lane(orders, leg, l) + pr_[-1])
-            p2 = np.array(N2) + d2 * (U_TOP_M - 40) + np.array([-d2[1], d2[0]]) * b_
+            p2 = np.array(N2) + d2 * (U_TOP_M - 75) + np.array([-d2[1], d2[0]]) * b_   # before the S-bend's ease
             cand = [k for k in range(j, len(c)) if E[k] == leg]
             i2 = min(cand, key=lambda k: np.hypot(*(c[k] - p2))) if cand else -1
+            if 0 <= i2 < len(c) - 4 and np.hypot(*(c[i2] - p2)) < 15:
+                p2 = c[i2].copy()                          # join the leg exactly as drawn there
+                d2 = c[i2 + 4] - c[i2]
+                d2 = d2 / max(np.hypot(*d2), 1e-9)
             if 0 <= i1 < j < i2 < len(c) - 1 and np.hypot(*(c[i2] - p2)) < 15 and np.hypot(*(c[i1] - p1)) < 15:
                 M = np.array([d1, -d2]).T
                 if abs(np.linalg.det(M)) > 1e-6:
