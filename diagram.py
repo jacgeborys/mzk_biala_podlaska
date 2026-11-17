@@ -2652,7 +2652,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 if len(part) < 2:
                     continue
                 if l in CASED_LINES:              # a light colour on the paper: a fine black outline
-                    ax.plot(part[:, 0], part[:, 1], color=INK, lw=lw + 1.3, solid_capstyle="butt",
+                    ax.plot(part[:, 0], part[:, 1], color=INK, lw=lw + 0.8, solid_capstyle="butt",
                             solid_joinstyle="round", zorder=(2.9 if ext[a_] else 3) - 0.01)
                 draw_line(ax, part, colors.get(l, "#888"), lw, ext[a_])
             g = LineString(c)
