@@ -1395,8 +1395,20 @@ def arm_shifts(edges, orders):
         if k == lk:
             return lane(orders, k, l) + edges[k]["shift_prof"][0]
         return -(lane(orders, k, l) + edges[k]["shift_prof"][-1])
+    g0 = edges[lk]["geom"]
+    dvec = np.array(g0.coords[1]) - np.array(g0.coords[0])
+    dvec /= np.hypot(*dvec)                     # down the legs
     for k, e in enumerate(edges):
         if "split_at" not in e and not e.get("shift_all"):
+            continue
+        g_ = e["geom"]
+        q_ = np.array(g_.interpolate(g_.length - 60 if e["v"] == N2 else 60).coords[0])
+        into = np.array(N2) - q_
+        if np.dot(into / max(np.hypot(*into), 1e-9), dvec) < math.cos(math.radians(30)):
+            # an arm turning into the legs (Sidorska west / east): not shifted at all, it stays on its street; its
+            # lanes turn into theirs on the legs on concentric arcs (u_turns), since every lane's offset changes
+            # by about the same amount there
+            e["u_turn_arm"] = True
             continue
         d = []
         for l in e["lines"]:
@@ -1557,7 +1569,99 @@ def draw_path(seq, l, edges, orders):
     t = smooth(t, STEP_M * 3)
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
     nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
-    return Q + nrm * O[:, None], E, Q
+    c = Q + nrm * O[:, None]
+    if U_INFO:
+        c, E, Q = u_turns(seq, l, edges, orders, c, E, Q)
+    return c, E, Q
+
+
+U_TURN_R_IN = 60    # m: radius of the innermost lane of an arm turning into a leg of the U
+U_ARM_LEAD_M = 350  # ... the turn is redrawn from this far back along the arm
+
+
+def u_turns(seq, l, edges, orders, c, E, Q):
+    """An arm turning into a leg of the Dworzec PKP U (Sidorska west / east): line l's lane on the arm (centred on
+    its street) and its lane on the leg are joined by a straight, a circular arc and a straight, the arc's radius
+    growing with the lane's distance from the inside of the turn, so the arm's lanes turn on concentric arcs
+    (their offsets change by about the same amount from street to leg, so the arcs share a centre) and nothing
+    is shifted along the street."""
+    N2, legs = U_INFO["node"], (U_INFO["left"], U_INFO["right"])
+    for (ia, fa), (ib, fb) in zip(seq, seq[1:]):
+        if (edges[ia]["v"] if fa else edges[ia]["u"]) != N2:
+            continue
+        if ia in legs and edges[ib].get("u_turn_arm"):
+            arm, leg, flip = ib, ia, True
+        elif ib in legs and edges[ia].get("u_turn_arm"):
+            arm, leg, flip = ia, ib, False
+        else:
+            continue
+        if flip:
+            c, E, Q = c[::-1], E[::-1], Q[::-1]
+        sd = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(c, axis=0).T))])
+        ia_ = np.where(E == arm)[0]
+        jb = [k for k in np.where(E == leg)[0] if ia_.size and k > ia_.min()]
+        done = False
+        if ia_.size and jb:
+            j = jb[0]
+            # the arm's lane, exactly: its last straight piece into the crossing, line l's lane on it, from at most
+            # half that piece back (the other half may be the corner at its far end)
+            ca = _SECTIONS[arm] if edges[arm]["v"] == N2 else _SECTIONS[arm][::-1]
+            d1 = ca[-1] - ca[-2]
+            seg_a = np.hypot(*d1)
+            d1 = d1 / seg_a
+            a_l = lane(orders, arm, l) * (1 if edges[arm]["v"] == N2 else -1)
+            p1 = np.array(N2) - d1 * min(U_ARM_LEAD_M, 0.5 * seg_a) + np.array([-d1[1], d1[0]]) * a_l
+            cand1 = [k for k in range(0, j) if E[k] == arm]
+            i1 = min(cand1, key=lambda k: np.hypot(*(c[k] - p1))) if cand1 else -1
+            # the leg's lane, exactly: its straight top (U_TOP_M from the crossing), line l's lane on it
+            gl = np.array(edges[leg]["geom"].coords)
+            down_u = edges[leg]["u"] == N2                         # left leg: drawn from the crossing down
+            d2 = (gl[1] - gl[0]) if down_u else (gl[-2] - gl[-1])
+            d2 = d2 / np.hypot(*d2)
+            pr_ = edges[leg]["shift_prof"]
+            b_ = (lane(orders, leg, l) + pr_[0]) if down_u else -(lane(orders, leg, l) + pr_[-1])
+            p2 = np.array(N2) + d2 * (U_TOP_M - 40) + np.array([-d2[1], d2[0]]) * b_
+            cand = [k for k in range(j, len(c)) if E[k] == leg]
+            i2 = min(cand, key=lambda k: np.hypot(*(c[k] - p2))) if cand else -1
+            if 0 <= i1 < j < i2 < len(c) - 1 and np.hypot(*(c[i2] - p2)) < 15 and np.hypot(*(c[i1] - p1)) < 15:
+                M = np.array([d1, -d2]).T
+                if abs(np.linalg.det(M)) > 1e-6:
+                    s_, t_ = np.linalg.solve(M, p2 - p1)
+                    t_ = -t_                                       # C = p2 - t_ * d2: before p2
+                    C = p1 + s_ * d1
+                    th = math.acos(float(np.clip(d1 @ d2, -1, 1)))
+                    turn = 1 if d1[0] * d2[1] - d1[1] * d2[0] > 0 else -1     # +1: a left turn
+                    sg = 1 if edges[arm]["v"] == N2 else -1
+                    out = lambda a: -a * turn  # noqa: E731  (left lanes are outside a right turn)
+                    a_all = [lane(orders, arm, x) * sg for x in edges[arm]["lines"]]
+                    r = U_TURN_R_IN + out(lane(orders, arm, l) * sg) - min(out(a) for a in a_all)
+                    tl = r * math.tan(th / 2)
+                    if s_ > 0 and t_ > 0 and th > math.radians(20):
+                        if tl > 0.95 * min(s_, t_):
+                            tl = 0.95 * min(s_, t_)
+                            r = tl / math.tan(th / 2)
+                        T1, T2 = C - d1 * tl, C + d2 * tl
+                        nl = np.array([-d1[1], d1[0]]) * turn
+                        ctr = T1 + nl * r
+                        a1 = math.atan2(*(T1 - ctr)[::-1])
+                        sweep = turn * th
+                        n1 = max(2, int(np.hypot(*(T1 - p1)) / STEP_M))
+                        n3 = max(2, int(np.hypot(*(p2 - T2)) / STEP_M))
+                        n2 = max(3, int(r * th / STEP_M))
+                        seg1 = [p1 + (T1 - p1) * f for f in np.linspace(0, 1, n1, endpoint=False)]
+                        arc = [ctr + r * np.array([math.cos(a1 + sweep * f), math.sin(a1 + sweep * f)])
+                               for f in np.linspace(0, 1, n2, endpoint=False)]
+                        seg3 = [T2 + (p2 - T2) * f for f in np.linspace(0, 1, n3)]
+                        new = np.array(seg1 + arc + seg3)
+                        newE = np.array([arm] * (n1 + n2 // 2) + [leg] * (len(new) - n1 - n2 // 2))
+                        c = np.vstack([c[:i1], new, c[i2 + 1:]])
+                        E = np.concatenate([E[:i1], newE, E[i2 + 1:]])
+                        Q = np.vstack([Q[:i1], new, Q[i2 + 1:]])
+                        done = True
+        if flip:
+            c, E, Q = c[::-1], E[::-1], Q[::-1]
+        _ = done
+    return c, E, Q
 
 
 def station_spots(stations, edges):
