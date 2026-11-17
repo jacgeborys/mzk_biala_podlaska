@@ -50,6 +50,14 @@ NO_BUS_STREETS = {
 BUS_WAYS = {
     123907910: "Białka frontage road north of the trunk, Białka 2 / Białka 3 stops (Street View, 2026-11-16)",
 }
+# Stop posts matched only to these OSM ways (when one is within reach): the stop is on that road and every bus
+# serving it uses it. Białka 2 / Białka 3: all E / K / T buses use the frontage road (user, 2026-11-17); the
+# Al. Solidarności 3 variants were matched to the trunk 11-22 m away and ran past the stops on it.
+STOP_WAYS = {
+    "170": {123907910}, "298": {123907910},      # Białka 2
+    "353": {123907910}, "354": {123907910},      # Białka 3 (NŻ)
+}
+SNAP_END = 30.0         # map matching: cost per metre a terminus stop lies off the shape (other stops: 3)
 # Turn penalties (in weighted metres), so routes do not zigzag through side streets
 # when a straighter path of equal length exists
 TURN_FREE_DEG = 20      # heading changes below this are free
@@ -264,7 +272,7 @@ class Router:
         path.reverse()
         return best - self.edges.w.iat[b], path
 
-    def candidates(self, pt, k=12, radius=60):
+    def candidates(self, pt, k=12, radius=60, ways=None):
         idx = self.tree.query(pt.buffer(radius))
         if len(idx) == 0:
             idx = [self.tree.nearest(pt)]
@@ -272,15 +280,25 @@ class Router:
         for i in idx:
             g = self.edges.geometry.iat[i]
             c.append((g.distance(pt), i, g.project(pt)))
+        if ways:                                   # pinned to these ways (STOP_WAYS), if any is within reach
+            osm = self.edges.osmid
+            pinned = [x for x in c if ways & (set(osm.iat[x[1]]) if isinstance(osm.iat[x[1]], list)
+                                              else {osm.iat[x[1]]})]
+            c = pinned or c
         return sorted(c)[:k]
 
-    def match(self, pts):
-        """pts: list of shapely Points (metric). Returns (coords, dist_at_stop, n_fallback)."""
+    def match(self, pts, ways=None):
+        """pts: list of shapely Points (metric); ways: per point a set of OSM way ids it is pinned to (or None).
+        Returns (coords, dist_at_stop, n_fallback)."""
         from shapely.ops import substring
         E = self.edges
-        cands = [self.candidates(p) for p in pts]
+        cands = [self.candidates(p, ways=w) for p, w in zip(pts, ways or [None] * len(pts))]
         SNAP = 3.0
-        score = [d * SNAP for d, _, _ in cands[0]]
+        # first and last stop (the termini) snapped much harder: the shape must reach the terminus post. With the
+        # plain weight E's inbound shapes ended on Przyjaźni, 50 m short of Twarda 1 (a right turn + 50 m of
+        # residential street cost about as much as 50 m of snapping)
+        snap = [SNAP_END if i in (0, len(pts) - 1) else SNAP for i in range(len(pts))]
+        score = [d * snap[0] for d, _, _ in cands[0]]
         back = []
         for i in range(1, len(pts)):
             new, bk = [], []
@@ -297,7 +315,7 @@ class Router:
                 if arg is None:  # unreachable from every previous candidate
                     j = int(np.argmin(score))
                     best, arg = score[j] + 5 * pts[i].distance(pts[i - 1]) + 1e6, j
-                new.append(best + d * SNAP)
+                new.append(best + d * snap[i])
                 bk.append(arg)
             score, back = new, back + [bk]
         # backtrack
@@ -374,7 +392,7 @@ def build_shapes(orders, prz):
     shapes, stop_dist, qa = [], {}, []
     for (line, var), seq in orders.items():
         sid = f"{line}_{var}"
-        coords, dists, fb = router.match([pt[s] for s in seq])
+        coords, dists, fb = router.match([pt[s] for s in seq], [STOP_WAYS.get(str(s)) for s in seq])
         straight = sum(pt[a].distance(pt[b]) for a, b in zip(seq, seq[1:]))
         for i, (a, b) in enumerate(zip(seq, seq[1:])):
             leg = dists[i + 1] - dists[i]

@@ -63,6 +63,7 @@ ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few cro
 U_TOP_M = 300        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
+PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -423,6 +424,8 @@ def fold_parallel(edges):
     while True:
         edges = collapse_triangles(edges)
         edges, n = _fold_once(edges)
+        if not n:
+            edges, n = fold_paths(edges)
         total += n
         if not n:
             break
@@ -431,9 +434,44 @@ def fold_parallel(edges):
     return edges
 
 
-def similar(a, b):
+def fold_paths(edges):
+    """An edge running beside a path of up to PATH_FOLD_EDGES other edges between the same two junctions, each
+    already carrying all its lines, of similar length and never more than PATH_FOLD_M away (Hausdorff), is dropped:
+    the same link drawn twice, e.g. E's far-east variant out along the north road and up the spur past the
+    cemetery, back down the spur and along DK2 50 m south. A loop round a block (A at Sławacinek) is farther apart
+    and stays. Removes one edge per call: (edges, 0 / 1)."""
+    import networkx as nx
+    for k, e in sorted(enumerate(edges), key=lambda t: -t[1]["geom"].length):
+        if e.get("raw") or e["u"] == e["v"]:
+            continue
+        G = nx.Graph()
+        for i, f in enumerate(edges):
+            if i != k and not f.get("raw") and f["u"] != f["v"] and e["lines"] <= f["lines"]:
+                if not G.has_edge(f["u"], f["v"]) or G[f["u"]][f["v"]]["w"] > f["geom"].length:
+                    G.add_edge(f["u"], f["v"], w=f["geom"].length, i=i)
+        if e["u"] not in G or e["v"] not in G:
+            continue
+        try:
+            path = nx.shortest_path(G, e["u"], e["v"], weight="w")
+        except nx.NetworkXNoPath:
+            continue
+        if len(path) - 1 > PATH_FOLD_EDGES:
+            continue
+        geoms = [edges[G[a][b]["i"]]["geom"] for a, b in zip(path, path[1:])]
+        if not similar(e["geom"].length, sum(g.length for g in geoms)):
+            continue
+        if e["geom"].hausdorff_distance(unary_union(geoms)) > PATH_FOLD_M:
+            continue
+        return chain_edges([f for i, f in enumerate(edges) if i != k]), 1
+    return edges, 0
+
+
+def similar(a, b, same_lines=False):
+    """Lengths close enough for two edges between the same junctions to be one corridor. Edges carrying exactly the
+    same lines (one link, its two directions on different roads, e.g. C on the DK2 / Janowska ramps: 289 vs
+    556 m) fold up to 2.5x."""
     a, b = sorted((a, b))
-    return b < 1.5 * a + 50
+    return b < (2.5 * a if same_lines else 1.5 * a + 50)
 
 
 def collapse_triangles(edges):
@@ -464,7 +502,7 @@ def _fold_once(edges):
         es = sorted(es, key=lambda e: (-len(e["lines"]), e["geom"].length))
         keep = [es[0]]
         for e in es[1:]:
-            if similar(e["geom"].length, keep[0]["geom"].length):
+            if similar(e["geom"].length, keep[0]["geom"].length, e["lines"] == keep[0]["lines"]):
                 keep[0] = dict(keep[0], lines=keep[0]["lines"] | e["lines"])
                 folded += 1
             else:
@@ -882,13 +920,16 @@ def continuations(node, i, others, edges, shapes):
     """Trips (of the given shapes) running from / to section i through node on to each of the sections `others`
     (see lead_in): {section: trips}."""
     g_i = edges[i]["geom"]
-    d = min(40.0, g_i.length / 2)
-    qi = g_i.interpolate(d if edges[i]["u"] == node else g_i.length - d)
+    at = lambda d: g_i.interpolate(min(d, g_i.length / 2) if edges[i]["u"] == node  # noqa: E731
+                                   else g_i.length - min(d, g_i.length / 2))
+    qi, qi2 = at(40.0), at(150.0)
     score = {}
     for g, n in shapes:
-        if g.distance(qi) >= EXT_TOL:
+        # the route must run ALONG section i (near both probes), not just sweep past its end at a merged junction
+        # (K's Białka -> cemetery trips passed 40 m into Al. Solidarności at the Białka roundabout)
+        if g.distance(qi) >= EXT_TOL or g.distance(qi2) >= EXT_TOL:
             continue
-        p, pn = g.project(qi), g.project(Point(node))
+        p, pn = g.project(qi2), g.project(Point(node))
         if g.interpolate(pn).distance(Point(node)) > EXT_TOL:
             continue
         pt = g.interpolate(pn + (LEAD_FOLLOW_M if pn > p else -LEAD_FOLLOW_M))
@@ -1110,6 +1151,8 @@ def draw_line(ax, xy, color, lw, ext, zorder=3):
     width in the colour washed 55 % towards the paper; hollow: coloured outline with a paper-coloured centre)."""
     kw = dict(solid_capstyle="butt", solid_joinstyle="round", dash_capstyle="butt")
     x, y = xy[:, 0], xy[:, 1]
+    if ext and zorder == 3:
+        zorder = 2.9                                # extensions under the full-service lines
     if not ext:
         ax.plot(x, y, color=color, lw=lw, zorder=zorder, **kw)
     elif EXT_STYLE == "dashed":
