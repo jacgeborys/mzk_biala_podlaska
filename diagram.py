@@ -51,6 +51,8 @@ SPACING = 26        # m between lanes of a bundle
 STEP_M = 6          # drawn lines are sampled this often
 SIMPLIFY_M = 30     # sections are simplified this much before their corners are rounded (street wiggles go)
 CORNER_R = 150      # m: corners become circular arcs of this radius (smaller where the legs are short)
+EXACT_TURNS = True    # a lane that would fold at a tight junction corner is redrawn lane to lane (exact_turns)
+LANE_CHANGE_SIDE = False  # lane changes at a junction on the side with fewer lines (off: centred; it pushed G under E on al. Tysiąclecia)
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
@@ -60,9 +62,9 @@ U_DEPTH_M = 690      # Dworzec PKP: the U hangs this far below the Sidorska / Al
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
-U_TOP_M = 300        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
+U_TOP_M = 285        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
 U_ARM_ALL_M = 700    # ... arms shorter than this are shifted along their whole length (straight: Sidorska west, 604 m)
-U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
+U_S_R = 175          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
 PRECISE_LINES = frozenset("G")   # lines drawn along their real streets where they run alone (user, 2026-11-17)
@@ -70,6 +72,7 @@ PRECISE_SIMPLIFY_M, PRECISE_R = 10, 90   # ... simplified this little, corners r
 CORNER_EASE = 0.0   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
 TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
+END_SPLIT_COST = 0.5  # order search: a line passing between lines that end at the junction (see node_cost)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
@@ -859,6 +862,26 @@ def station_access(edges, stations):
 
 
 # ---------------------------------------------------------------- 4: line order (per edge)
+def drop_duplicate_sections(edges):
+    """A section between the same two junctions as another that carries all its lines and either runs within 45 m
+    of it or is a longer way round of at most 600 m (F's one-way terminal loop at Akademicka, whose corners the
+    relaxation flattened onto the K / F section beside it) is emptied (kept as an edge so indices stay valid): it
+    was drawn as a second line on top of the bundle."""
+    n = 0
+    for i, e in enumerate(edges):
+        if not e["lines"] or e.get("raw") or "twin_of" in e:
+            continue                      # (a twin is B's second pass along Sidorska, meant to be there)
+        for j, f in enumerate(edges):
+            if j == i or not f["lines"] or f.get("raw") or {e["u"], e["v"]} != {f["u"], f["v"]}:
+                continue
+            if e["lines"] <= f["lines"] and (e["geom"].hausdorff_distance(f["geom"]) < 45 or
+                                             f["geom"].length < e["geom"].length <= 600) and                     (e["lines"] < f["lines"] or e["geom"].length > f["geom"].length):
+                e["lines"] = frozenset()
+                n += 1
+                break
+    print(f"duplicate sections dropped: {n}")
+
+
 def node_passes(edges):
     """For every node: incident edges with their heading away from the node and +1 / -1 (edge leaves / enters)."""
     nodes = defaultdict(list)
@@ -907,6 +930,15 @@ def node_cost(inc, orders, edges, node=None):
         elif (l, node) in JOINS:             # 3+ sections: the joins the drawing makes (the routes' main relations)
             passes += [(l, p, q) for p, q in JOINS[(l, node)] if p in ea and q in ea]
     cost = 0.0
+    # lines ending here kept together: a line passing through with lines ending here on both sides of it on the
+    # same section costs END_SPLIT_COST (H between I and M at Terebelska Pętla, its capsule cut across them)
+    ends_here = {l for l, ea in per_line.items() if len(ea) == 1}
+    if ends_here:
+        for i, h, sgn in inc:
+            ls = orders[i]
+            for k, l in enumerate(ls):
+                if l not in ends_here and any(x in ends_here for x in ls[:k]) and any(x in ends_here for x in ls[k + 1:]):
+                    cost += END_SPLIT_COST
     for a, p, q in passes:                               # lane shifts of a line passing through
         ea = per_line[a]
         cost += SHIFT_COST * abs(-left_of(orders, p, a, ea[p][1]) - left_of(orders, q, a, ea[q][1]))
@@ -1006,6 +1038,73 @@ def lane(orders, i, l):
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING + LANE_SHIFT.get(i, 0.0)
 
 
+def vertex_R(edges, orders, adj):
+    """Corner radius at a vertex between sections adj: PRECISE_R inside a precise line, else CORNER_R, but never
+    tighter than the widest bundle there + 2 lanes (lanes and shifts of the U included), the same for every line
+    through it (concentric lanes). Corners inside the U's legs keep CORNER_R (drawn as designed)."""
+    if adj and all(is_precise(edges[k]) for k in adj):
+        return PRECISE_R
+    if adj and all(edges[k].get("raw") for k in adj):
+        return CORNER_R
+    return max([CORNER_R] + [edge_extent(edges, orders, k) + 2 * SPACING for k in adj])
+
+
+TLCAP = {}      # (edge, segment of its section) -> metres an arc may use at its start / end
+
+
+def compute_tl_caps(edges, orders):
+    """For every segment of every drawn section: how much of it the arcs at its two ends may use. Each end asks
+    for R * tan(turn / 2) (the largest over the ways lines turn there; at a junction every pair of sections sharing
+    a line); when both do not fit, the segment is shared in proportion (0.95 of it), so a corner next to a short
+    piece whose far end is straight can use nearly all of it (L into Zamkowa)."""
+    TLCAP.clear()
+    at = defaultdict(list)
+    for i, e in enumerate(edges):
+        if i in _SECTIONS and len(_SECTIONS[i]) >= 2:
+            at[e["u"]].append(i)
+            at[e["v"]].append(i)
+
+    def ends(i, n):                       # unit direction of section i's end segment pointing away from node n
+        c = _SECTIONS[i]
+        if np.hypot(*(c[0] - np.array(n))) <= np.hypot(*(c[-1] - np.array(n))):
+            v = c[1] - c[0]
+        else:
+            v = c[-2] - c[-1]
+        return v / max(np.hypot(*v), 1e-9)
+    node_need = {}
+    for n, es in at.items():
+        for a in es:
+            best = 0.0
+            for b in es:
+                if a == b or not edges[a]["lines"] & edges[b]["lines"]:
+                    continue
+                th = math.pi - math.acos(float(np.clip(ends(a, n) @ ends(b, n), -1, 1)))
+                if th < math.radians(1) or th > math.radians(179):
+                    continue
+                best = max(best, vertex_R(edges, orders, [a, b]) * math.tan(th / 2))
+            node_need[(a, n)] = best
+    for i, c in _SECTIONS.items():
+        if i >= len(edges) or len(c) < 2:
+            continue
+        e = edges[i]
+        need = np.zeros(len(c))
+        for k in range(1, len(c) - 1):
+            v1, v2 = c[k] - c[k - 1], c[k + 1] - c[k]
+            th = math.acos(float(np.clip(v1 @ v2 / (np.hypot(*v1) * np.hypot(*v2) + 1e-9), -1, 1)))
+            if th > math.radians(1):
+                need[k] = vertex_R(edges, orders, [i]) * math.tan(min(th, math.radians(178)) / 2)
+        for k_, idx in ((0, 0), (len(c) - 1, -1)):
+            n = min((e["u"], e["v"]), key=lambda n_: np.hypot(*(np.array(n_) - c[idx])))
+            need[k_] = node_need.get((i, n), 0.0)
+        for k in range(len(c) - 1):
+            L_ = float(np.hypot(*(c[k + 1] - c[k])))
+            a, b = need[k], need[k + 1]
+            if a + b <= 0.95 * L_ or a + b <= 0:
+                TLCAP[(i, k)] = (0.95 * L_ - b, 0.95 * L_ - a)     # each end: whatever the other leaves
+            else:
+                TLCAP[(i, k)] = (0.95 * L_ * a / (a + b), 0.95 * L_ * b / (a + b))
+
+
 def edge_extent(edges, orders, i):
     """How far the farthest lane of edge i lies from its centreline (lane shifts of an arm of the U included)."""
     e = edges[i]
@@ -1042,8 +1141,10 @@ def fillet(c, R, cap=None):
             sid.append(i)
             continue
         Ri = R[i] if np.ndim(R) else R               # per-vertex radius (precise lines: small)
-        ca, cb = (0.5, 0.5) if cap is None else (cap[i - 1], cap[i])   # share of each leg the arc may use
-        tl = min(Ri * math.tan(th / 2), seg[i - 1] * ca, seg[i] * cb)
+        if cap is None:
+            tl = min(Ri * math.tan(th / 2), seg[i - 1] * 0.5, seg[i] * 0.5)
+        else:                                        # metres of each leg the arc may use (TLCAP)
+            tl = min(Ri * math.tan(th / 2), cap[1][i - 1], cap[0][i])
         r = tl / math.tan(th / 2)
         T1, T2 = c[i] + v1 * tl, c[i] + v2 * tl
         b = (v1 + v2) / (np.linalg.norm(v1 + v2) + 1e-9)
@@ -1454,12 +1555,12 @@ def hold_lanes(edges, orders, stations, spots):
             offs = dict(cont)
             others = [l for l in orders[j] if l not in cont]
             ci = [orders[j].index(l) for l in cont]
-            for l in others:                                       # joining lines: outside, on their side
+            for l in others:          # joining lines: outside the whole incoming bundle, on their side (C next to G)
                 o_ = orders[j].index(l)
                 if o_ > max(ci):
-                    offs[l] = min(offs.values()) - SPACING
+                    offs[l] = min(list(offs.values()) + list(held.values())) - SPACING
                 elif o_ < min(ci):
-                    offs[l] = max(offs.values()) + SPACING
+                    offs[l] = max(list(offs.values()) + list(held.values())) + SPACING
             c = _SECTIONS[j] if e["u"] == node else _SECTIONS[j][::-1]
             sd = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(c, axis=0), axis=1))])
             upto = left if sd[-1] > left + 30 else math.inf
@@ -1474,11 +1575,98 @@ def hold_lanes(edges, orders, stations, spots):
             cur, node = j, (e["v"] if e["u"] == node else e["u"])
 
 
+BRIDGE = {}     # (edge in, edge out, node) -> lines bridged from their lane before to theirs after the next corner
+
+
+def bridge_lanes(seq, l, edges, orders, c, E, Q):
+    """See hold_inner_lanes: a cubic curve (tangent to both lanes) from line l's lane on the section before the
+    junction to its lane on the second piece of the section after it."""
+    for (ia, fa), (ib, fb) in zip(seq, seq[1:]):
+        n = edges[ia]["v"] if fa else edges[ia]["u"]
+        key = (ia, ib, n) if (ia, ib, n) in BRIDGE else (ib, ia, n) if (ib, ia, n) in BRIDGE else None
+        if key is None or l not in BRIDGE[key]:
+            continue
+        rev = key[0] != ia                        # chain runs from the short section's side
+        if rev:
+            c, E, Q = c[::-1], E[::-1], Q[::-1]
+            ia, ib = key[0], key[1]
+        sa = _SECTIONS[ia] if edges[ia]["v"] == n else _SECTIONS[ia][::-1]
+        sb = _SECTIONS[ib] if edges[ib]["u"] == n else _SECTIONS[ib][::-1]
+        if len(sb) >= 3:
+            d1 = sa[-1] - sa[-2]
+            la = float(np.hypot(*d1))
+            d1 = d1 / la
+            d2 = sb[2] - sb[1]
+            lb = float(np.hypot(*d2))
+            d2 = d2 / lb
+            o_a = lane(orders, ia, l) * (1 if edges[ia]["v"] == n else -1)
+            o_b = lane(orders, ib, l) * (1 if edges[ib]["u"] == n else -1)
+            p1 = sa[-1] + np.array([-d1[1], d1[0]]) * o_a - d1 * min(150.0, 0.5 * la)
+            p2 = sb[1] + np.array([-d2[1], d2[0]]) * o_b + d2 * min(180.0, 0.5 * lb)
+            ka = [k for k in range(len(c)) if E[k] == ia]
+            kb = [k for k in range(len(c)) if E[k] == ib]
+            if ka and kb:
+                i1 = min(ka, key=lambda k: np.hypot(*(c[k] - p1)))
+                i2 = min(kb, key=lambda k: np.hypot(*(c[k] - p2)))
+                if i1 < i2 and np.hypot(*(c[i1] - p1)) < 15 and np.hypot(*(c[i2] - p2)) < 15:
+                    L_ = float(np.hypot(*(p2 - p1)))
+                    b1, b2 = p1 + d1 * L_ * 0.4, p2 - d2 * L_ * 0.4
+                    m = max(8, int(L_ / STEP_M))
+                    tt = np.linspace(0, 1, m)[:, None]
+                    new = ((1 - tt) ** 3) * p1 + 3 * ((1 - tt) ** 2) * tt * b1 + 3 * (1 - tt) * tt ** 2 * b2 + tt ** 3 * p2
+                    newE = np.array([ia] * (m // 2) + [ib] * (m - m // 2))
+                    c = np.vstack([c[:i1], new, c[i2 + 1:]])
+                    E = np.concatenate([E[:i1], newE, E[i2 + 1:]])
+                    Q = np.vstack([Q[:i1], new, Q[i2 + 1:]])
+        if rev:
+            c, E, Q = c[::-1], E[::-1], Q[::-1]
+    return c, E, Q
+
+
+def hold_inner_lanes(edges, orders):
+    """A line on the inside of a sharp junction turn (over 45 degrees) that would have to move more than 1.5 lanes
+    towards the centre onto a short first piece (under 250 m, the next corner close: L from the 9-line bundle on
+    Narutowicza north onto al. Tysiąclecia, 180 m before Brzeska) cannot get from its lane to the short piece's
+    lane in between (a stair-step, or a hook if held): it is bridged (BRIDGE) straight from its lane before the
+    junction to its lane after the next corner by one smooth curve (draw_path, bridge_lanes)."""
+    BRIDGE.clear()
+    at = defaultdict(list)
+    for i, e in enumerate(edges):
+        if e["lines"] and i in _SECTIONS and not e.get("raw"):
+            at[e["u"]].append(i)
+            at[e["v"]].append(i)
+
+    def away(i, n):
+        c = _SECTIONS[i] if edges[i]["u"] == n else _SECTIONS[i][::-1]
+        v = c[1] - c[0]
+        return c, v / max(np.hypot(*v), 1e-9)
+    for n, es in at.items():
+        for a in es:
+            for b in es:
+                if a == b or b in HOLD:
+                    continue
+                ca, va = away(a, n)
+                cb, vb = away(b, n)
+                d1 = -va                                           # travel into n along a, out along b
+                th = math.acos(float(np.clip(d1 @ vb, -1, 1)))
+                if th < math.radians(45) or len(cb) < 3:
+                    continue
+                turn = 1 if d1[0] * vb[1] - d1[1] * vb[0] > 0 else -1
+                seg = float(np.hypot(*(cb[1] - cb[0])))
+                if seg >= 250:
+                    continue
+                for l in edges[a]["lines"] & edges[b]["lines"]:
+                    o_a = lane(orders, a, l) * (1 if edges[a]["v"] == n else -1)   # left of travel into n
+                    o_b = lane(orders, b, l) * (1 if edges[b]["u"] == n else -1)   # left of travel out of n
+                    if turn * o_a > 0 and turn * o_a - turn * o_b > 1.5 * SPACING:
+                        BRIDGE.setdefault((a, b, n), set()).add(l)
+
+
 def draw_path(seq, l, edges, orders):
     """Drawn coordinates of one chain (subway_like_map style): each section simplified, corners (inside sections
     and at junctions) replaced by circular arcs of radius CORNER_R, the lane offset eased over RAMP_M m wherever
     it changes, then applied along the normals, so a bundle bends as concentric arcs."""
-    pts, seg_off, seg_edge = [], [], []
+    pts, seg_off, seg_edge, seg_k = [], [], [], []
     for i, fwd in seq:
         if i not in _SECTIONS:
             _SECTIONS[i] = section_coords(edges[i], len(orders[i]))
@@ -1504,6 +1692,8 @@ def draw_path(seq, l, edges, orders):
         if "shift_prof" in edges[i]:                # whole bundle shifted (the U's legs, side by side at the top)
             pr = np.array(edges[i]["shift_prof"], float)
             offs = offs + (pr if fwd else -pr[::-1])
+        nseg = len(c) - 1
+        seg_k.extend([(i, (t if fwd else nseg - 1 - t), fwd) for t in range(nseg)])
         if pts:
             c, offs = c[1:], offs[1:]
         pts.extend(c)
@@ -1523,20 +1713,17 @@ def draw_path(seq, l, edges, orders):
     # II); same radius for every line through it, so the lanes stay concentric
     # (at the Dworzec PKP crossing: an arm turning into a leg of the U, whose first 300 m are straight, may use 3/4
     # of that straight, so the shifted Sidorska arm's inner lanes get room)
-    capf = np.full(max(ns, 1), 0.5)
     for v in range(1, len(P) - 1):
         adj = [seg_edge[q] for q in (v - 1, v) if 0 <= q < ns]
-        if any(is_precise(edges[k]) for k in adj):
-            continue
-        raw = [k for k in adj if edges[k].get("raw")]
-        if raw:
-            if len(raw) == len(adj) or not U_INFO or np.hypot(*(P[v] - np.array(U_INFO["node"]))) > 1:
-                continue
-            for q in (v - 1, v):
-                if 0 <= q < ns and edges[seg_edge[q]].get("raw"):
-                    capf[q] = 0.75
-        Rv[v] = max(Rv[v], max(edge_extent(edges, orders, k) for k in adj) + 2 * SPACING)
-    F, sid = fillet(P, Rv, capf)
+        Rv[v] = vertex_R(edges, orders, adj)
+    # how much of each segment an arc may use: shared between the corners at its two ends by what they need
+    # (TLCAP), not half each, so a sharp turn next to a short piece whose other end is straight gets room
+    capA = np.array([TLCAP.get((i, k), (None, None))[0 if fw else 1] for i, k, fw in seg_k], dtype=object)
+    capB = np.array([TLCAP.get((i, k), (None, None))[1 if fw else 0] for i, k, fw in seg_k], dtype=object)
+    segl = np.linalg.norm(np.diff(P, axis=0), axis=1)
+    capA = np.array([segl[q] * 0.5 if capA[q] is None else capA[q] for q in range(len(segl))], float)
+    capB = np.array([segl[q] * 0.5 if capB[q] is None else capB[q] for q in range(len(segl))], float)
+    F, sid = fillet(P, Rv, (capA, capB))
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
     keep = np.concatenate([[True], np.diff(s) > 1e-6])
     F, s, sid = F[keep], s[keep], np.array(sid)[keep]
@@ -1554,7 +1741,7 @@ def draw_path(seq, l, edges, orders):
     bnd = [j for j in range(1, len(E)) if E[j] != E[j - 1]]
     for n_, j in enumerate(bnd):
         na, nb = len(edges[E[j - 1]]["lines"]), len(edges[E[j]]["lines"])
-        if na == nb or O[j] == O[j - 1]:
+        if not LANE_CHANGE_SIDE or na == nb or O[j] == O[j - 1]:
             continue
         lo_ = ds[bnd[n_ - 1]] if n_ else -math.inf
         hi_ = ds[bnd[n_ + 1]] if n_ + 1 < len(bnd) else math.inf
@@ -1570,8 +1757,88 @@ def draw_path(seq, l, edges, orders):
     t /= np.maximum(np.hypot(t[:, 0], t[:, 1]), 1e-9)[:, None]
     nrm = np.stack([-t[:, 1], t[:, 0]], axis=1)
     c = Q + nrm * O[:, None]
+    if BRIDGE:
+        c, E, Q = bridge_lanes(seq, l, edges, orders, c, E, Q)
+    if EXACT_TURNS:
+        c, E, Q = exact_turns(seq, l, edges, orders, c, E, Q)
     if U_INFO:
         c, E, Q = u_turns(seq, l, edges, orders, c, E, Q)
+    return c, E, Q
+
+
+def exact_turns(seq, l, edges, orders, c, E, Q):
+    """An inner lane that would fold at a tight junction corner (the corner's arc smaller than the lane's distance
+    inside it: L on the inside of the 9-line bundle at Zamkowa / Narutowicza and al. Tysiąclecia, where the next
+    junction leaves too little road for a wide arc) is redrawn from its lane on the street before to its lane on
+    the street after as straight - circular arc - straight (radius: the corner's centreline radius minus the line's
+    mean offset inside, at least 0.8 lane), instead of looping back on itself (a V, a stair-step). Only such
+    lanes: the others keep the bundle's concentric arcs."""
+    for (ia, fa), (ib, fb) in zip(seq, seq[1:]):
+        ea, eb = edges[ia], edges[ib]
+        if any(e_.get("raw") or "end_shift" in e_ or "shift_prof" in e_ for e_ in (ea, eb)):
+            continue
+        if any(k_ in HOLD and l in HOLD[k_][2] for k_ in (ia, ib)):
+            continue
+        o_in = lane(orders, ia, l) * (1 if fa else -1)
+        o_out = lane(orders, ib, l) * (1 if fb else -1)
+        sa = _SECTIONS[ia] if fa else _SECTIONS[ia][::-1]
+        sb = _SECTIONS[ib] if fb else _SECTIONS[ib][::-1]
+        if len(sa) < 2 or len(sb) < 2:
+            continue
+        Nn = sa[-1]
+        d1, d2 = sa[-1] - sa[-2], sb[1] - sb[0]
+        seg_in, seg_out = float(np.hypot(*d1)), float(np.hypot(*d2))
+        d1, d2 = d1 / seg_in, d2 / seg_out
+        th = math.acos(float(np.clip(d1 @ d2, -1, 1)))
+        if th < math.radians(20) or th > math.radians(170):
+            continue
+        turn = 1 if d1[0] * d2[1] - d1[1] * d2[0] > 0 else -1
+        n1, n2 = np.array([-d1[1], d1[0]]), np.array([-d2[1], d2[0]])
+        kin = len(_SECTIONS[ia]) - 2 if fa else 0
+        kout = 0 if fb else len(_SECTIONS[ib]) - 2
+        cap_in = TLCAP.get((ia, kin), (0.5 * seg_in, 0.5 * seg_in))[1 if fa else 0]
+        cap_out = TLCAP.get((ib, kout), (0.5 * seg_out, 0.5 * seg_out))[0 if fb else 1]
+        tan_ = math.tan(th / 2)
+        tl_c = min(vertex_R(edges, orders, [ia, ib]) * tan_, cap_in, cap_out)
+        M = np.array([d1, -d2]).T
+        s_, t_ = np.linalg.solve(M, (Nn + n2 * o_out) - (Nn + n1 * o_in))
+        C = Nn + n1 * o_in + d1 * s_                 # where the two lanes meet; s_ along d1 from the node
+        t_ = -t_                                     # ... and C = Nn + n2 * o_out - d2 * t_
+        R_eff = tl_c / tan_
+        if min(R_eff - turn * o_in, R_eff - turn * o_out) >= SPACING:
+            continue                                 # the lane bends on its own arc with room: drawn as is
+        r = max(R_eff - turn * (o_in + o_out) / 2, 0.8 * SPACING)
+        tl = r * tan_
+        back = min(max(tl_c, 90.0, tl - s_), cap_in)          # how far before the node the redrawn piece starts
+        fwd_ = min(max(tl_c, 90.0, tl - t_), cap_out)
+        tl = min(tl, s_ + back, t_ + fwd_)
+        if tl <= 1:
+            continue
+        r = tl / tan_
+        p1 = Nn + n1 * o_in - d1 * back
+        p2 = Nn + n2 * o_out + d2 * fwd_
+        ka = [k for k in range(len(c)) if E[k] == ia]
+        kb = [k for k in range(len(c)) if E[k] == ib]
+        if not ka or not kb:
+            continue
+        i1 = min(ka, key=lambda k: np.hypot(*(c[k] - p1)))
+        i2 = min(kb, key=lambda k: np.hypot(*(c[k] - p2)))
+        if not (i1 < i2) or np.hypot(*(c[i1] - p1)) > 12 or np.hypot(*(c[i2] - p2)) > 12:
+            continue
+        T1, T2 = C - d1 * tl, C + d2 * tl
+        ctr = T1 + n1 * turn * r
+        a1 = math.atan2(*(T1 - ctr)[::-1])
+        m1 = max(2, int(np.hypot(*(T1 - c[i1])) / STEP_M))
+        m3 = max(2, int(np.hypot(*(c[i2] - T2)) / STEP_M))
+        m2 = max(3, int(r * th / STEP_M))
+        new = np.array([c[i1] + (T1 - c[i1]) * f for f in np.linspace(0, 1, m1, endpoint=False)]
+                       + [ctr + r * np.array([math.cos(a1 + turn * th * f), math.sin(a1 + turn * th * f)])
+                          for f in np.linspace(0, 1, m2, endpoint=False)]
+                       + [T2 + (c[i2] - T2) * f for f in np.linspace(0, 1, m3)])
+        newE = np.array([ia] * (m1 + m2 // 2) + [ib] * (len(new) - m1 - m2 // 2))
+        c = np.vstack([c[:i1], new, c[i2 + 1:]])
+        E = np.concatenate([E[:i1], newE, E[i2 + 1:]])
+        Q = np.vstack([Q[:i1], new, Q[i2 + 1:]])
     return c, E, Q
 
 
@@ -1716,6 +1983,7 @@ STREET_LABELS = {
 }
 STREET_SIZE, STREET_COLOR = 10.5, "#8e8e8e"
 STREET_NEAR_CENTRE = {"Sidorska", "Francuska"}
+STREET_PIN = {"Zamkowa": (782262, 471235), "Gabriela Narutowicza": (782680, 470833)}  # names kept here (user)
 
 
 def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
@@ -1765,7 +2033,9 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
         h = STREET_SIZE * 1.15 * m
         # spots nearest the middle of the street's longest section first; the preferred side (below a horizontal
         # street, right of a vertical one) anywhere along the street before the other side
-        if street in STREET_NEAR_CENTRE:               # long radial streets: named close to the city
+        if street in STREET_PIN:                       # placed where the user liked them
+            cs = sorted(cs, key=lambda c_: np.hypot(*(c_[1] - np.array(STREET_PIN[street]))))
+        elif street in STREET_NEAR_CENTRE:             # long radial streets: named close to the city
             cs = sorted(cs, key=lambda c_: np.hypot(*(c_[1] - centre)))
         else:
             cs = sorted(cs, key=lambda c_: (-c_[5], abs(c_[4] - c_[5] / 2)))
@@ -1783,7 +2053,8 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
                                 cen - t * w / 2 - nrm * h / 2, cen + t * w / 2 - nrm * h / 2])
                 if not frame.contains(poly):
                     continue
-                if any(occ[k].intersects(poly) for k in occ_tree.query(poly)):
+                tol = 120 if street in STREET_PIN else 0       # a pinned name may graze a line's edge (box corner)
+                if sum(occ[k].intersection(poly).area for k in occ_tree.query(poly)) > tol:
                     continue
                 if any(q.buffer(12).intersects(poly) for q in placed):
                     continue
@@ -1869,6 +2140,8 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     line_ends = []                                # (line, end point, direction pointing out of the line)
     spots = station_spots(stations, edges)
     hold_lanes(edges, orders, stations, spots)
+    hold_inner_lanes(edges, orders)
+    compute_tl_caps(edges, orders)
     ending_cut = defaultdict(set)                 # terminus station -> lines cut there
     term_cut = defaultdict(list)                  # terminus station -> points where lines ending there were cut
     shifted = {}      # terminus station -> (station point moved along the road, tip: the peak of a side line's arc)
@@ -2486,6 +2759,7 @@ def main():
     edges = drop_turning_stubs(edges, stations)
     edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
     hairpin_tips(edges, stations)
+    drop_duplicate_sections(edges)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     shapes = defaultdict(list)                   # line -> [(shape, trips of the day)]
     for sid, g in geoms.items():
