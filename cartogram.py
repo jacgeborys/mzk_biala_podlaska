@@ -573,7 +573,7 @@ def draw(edges, n_trips, date, frame, out, limits=None):
         lax.text(1.3, y, label, ha="left", va="center",
                  fontproperties=bahn(12), color=INK)
 
-    # scale bar + north arrow, bottom left
+    # scale bar, bottom left (no north arrow: north is up, as on the other maps)
     km = 3 if w > 9000 else 2
     sx, sy = frame[0] + w * 0.025, frame[1] + h * 0.045
     for k in range(km * 2):
@@ -582,9 +582,6 @@ def draw(edges, n_trips, date, frame, out, limits=None):
     ax.text(sx, sy + h * 0.014, "0", ha="center", va="bottom", fontproperties=bahn(10), color=INK, zorder=10)
     ax.text(sx + km * 1000, sy + h * 0.014, f"{km} km", ha="center", va="bottom", fontproperties=bahn(10),
             color=INK, zorder=10)
-    ax.annotate("", xy=(sx + 120, sy + h * 0.16), xytext=(sx + 120, sy + h * 0.08),
-                arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.2, mutation_scale=18), zorder=10)
-    ax.text(sx + 120, sy + h * 0.17, "N", ha="center", va="bottom", fontproperties=bahn(11), color=INK, zorder=10)
 
     ax.text(0.5, 0.012, "Dane: rozkład MZK Biała Podlaska (GTFS nieoficjalny) · © OpenStreetMap contributors, "
             "2026 Jacek Gęborys", transform=ax.transAxes, ha="center", va="bottom", fontproperties=bahn(12),
