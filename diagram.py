@@ -2241,7 +2241,7 @@ STREET_LABELS = {
     "Łomaska": "Łomaska", "Francuska": "Francuska", "Białka": "Białka", "Królowej Jadwigi": "Królowej Jadwigi",
     "Podleśna": "Podleśna", "Lubelska": "Lubelska",
     "Sitnicka": "Sitnicka", "Robotnicza": "Robotnicza",
-    "Armii Krajowej": "Armii Krajowej", "Koncertowa": "Koncertowa", "Aleja Riada Haidara": "al. Haidara",
+    "Armii Krajowej": "Armii Krajowej", "Witoroska": "Witoroska", "Aleja Riada Haidara": "al. Haidara",
 }
 STREET_SIZE, STREET_COLOR = 10.5, "#8e8e8e"
 STREET_NEAR_CENTRE = {"Sidorska", "Francuska", "Lubelska", "Janowska"}
@@ -2355,6 +2355,7 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
     print(f"street names: {n_done} of {len(STREET_LABELS)} placed")
 
 
+CASED_LINES = {"L"}    # lines drawn with a fine black outline (L's yellow on the cream paper)
 EXT_STYLE = "pale"     # how extensions are drawn: dashed / thin / pale / hollow (--ext-style)
 
 
@@ -2650,6 +2651,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 part = c[max(a_ - 1, 0):b_]
                 if len(part) < 2:
                     continue
+                if l in CASED_LINES:              # a light colour on the paper: a fine black outline
+                    ax.plot(part[:, 0], part[:, 1], color=INK, lw=lw + 1.3, solid_capstyle="butt",
+                            solid_joinstyle="round", zorder=(2.9 if ext[a_] else 3) - 0.01)
                 draw_line(ax, part, colors.get(l, "#888"), lw, ext[a_])
             g = LineString(c)
             drawn.append(g)
