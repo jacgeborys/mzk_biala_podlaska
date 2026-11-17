@@ -131,13 +131,15 @@ def load(date):
     line_trips = day.groupby("route_id").size()
     st_tab = stops[stops.location_type == 1].set_index("stop_id")
     sx, sy = tr.transform(st_tab.stop_lon.values, st_tab.stop_lat.values)
+    calls = st.drop_duplicates(["trip_id", "station"]).groupby(["station", "route_id"]).size()   # trips per line
     stations = {}
     for sid_, name, x, y in zip(st_tab.index, st_tab.stop_name, sx, sy):
         lines = set(st[st.station == sid_].route_id)
         if not lines:
             continue
         term = {l for l in lines if ends.get((sid_, l), 0) >= MAIN_TERMINUS * line_trips[l]}
-        stations[sid_] = dict(name=name, xy=np.array([x, y]), lines=lines, term=term)
+        stations[sid_] = dict(name=name, xy=np.array([x, y]), lines=lines, term=term,
+                              trips={l: int(calls.get((sid_, l), 0)) for l in lines})
     return geoms, n_shape, line_of, stations, line_trips
 
 
@@ -1067,13 +1069,23 @@ def relax_junction_corners(edges, orders):
                     th = math.acos(float(np.clip(np.dot(v1, v2) / (l1 * l2 + 1e-9), -1, 1)))
                     if th < math.radians(10) or th > math.radians(160):
                         continue
-                    w = max(len(orders[a]), len(orders[b]))
-                    need = 2 * ((w - 1) / 2 * SPACING + 0.8 * SPACING) * math.tan(th / 2)
+                    # sized for how far the lines turning from a onto b sit from the centre of either street;
+                    # a vertex that is itself a sharp street corner is never dropped (sizing for the whole 9-line
+                    # bundle used to erase G's corner onto al. Jana Pawła II and its S-bend)
+                    shared = edges[a]["lines"] & edges[b]["lines"]
                     for k, c_, l_ in ((a, ca, l1), (b, cb[::-1], l2)):
+                        r_k = max(max(abs(lane(orders, a, l)), abs(lane(orders, b, l))) for l in shared)                             + 0.8 * SPACING
+                        need = 2 * r_k * math.tan(th / 2)
                         e_ = edges[k]
                         if l_ >= need or len(c_) < 3 or e_.get("raw") or (e_.get("split_at") or (None,))[0] == n:
                             continue
-                        c2 = np.delete(c_, len(c_) - 2, axis=0)          # the vertex next to n
+                        v = len(c_) - 2                                    # the vertex next to n ...
+                        w1, w2 = c_[v] - c_[v - 1], c_[v + 1] - c_[v]
+                        cv = np.dot(w1, w2) / (np.hypot(*w1) * np.hypot(*w2) + 1e-9)
+                        if cv < math.cos(math.radians(45)) and np.hypot(*(c_[v] - c_[-1])) > 250:
+                            continue          # ... unless it is a real street corner away from the junction (G onto
+                            #                   al. Jana Pawła II, 420 m on); corners right at a junction may go
+                        c2 = np.delete(c_, v, axis=0)
                         _SECTIONS[k] = c2 if np.array_equal(c_[0], _SECTIONS[k][0]) else c2[::-1]
                         dropped += 1
                         changed = True
@@ -1240,7 +1252,7 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
     o = ox.graph_to_gdfs(G, nodes=False).reset_index()
     o = o[o["name"].notna()]
     names = [n[0] if isinstance(n, list) else n for n in o["name"]]
-    keep = [k for k, n in enumerate(names) if n in STREET_LABELS]
+    keep = list(range(len(names)))            # every named street: the one really under the line decides
     otree = STRtree([o.geometry.iat[k] for k in keep])
     # candidate spots: every 30 m along each drawn section where the street under it is a labelled one
     cands = defaultdict(list)                 # street -> [(edge, point on the section, unit tangent, half-width)]
@@ -1254,7 +1266,7 @@ def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
         for dd in np.arange(80, sec.length - 80, 30):
             p = sec.interpolate(dd)
             k = otree.nearest(p)
-            if otree.geometries[k].distance(p) > 30:
+            if otree.geometries[k].distance(p) > 30 or names[keep[k]] not in STREET_LABELS:
                 continue
             a, b = sec.interpolate(dd - 70), sec.interpolate(dd + 70)
             a2, b2 = sec.interpolate(dd - 70), sec.interpolate(dd)
@@ -1672,6 +1684,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         bullets = [(l, "o") for l in sorted(main)] + [(l, "D") for l in sorted(var_end.get(sid, set()) - main)]
         requests.append((0 if key_st else 1, -len(st_["lines"]), sid, base, zone, bullets))
 
+    def bullet_w(bullets, sid):
+        """Width of a row of bullets in points (a diamond carries its trips a day after it)."""
+        return sum(15 + (4 + 5.2 * len(str(stations[sid]["trips"].get(l, 0))) if mk == "D" else 0)
+                   for l, mk in bullets)
+
     # label placement: as close to the stop as possible (16 directions, sliding outwards from the capsule),
     # off other names at any cost, off the lines where that costs little distance
     occ = [g.buffer(lw * m_per_pt / 2 + 4) for g in drawn]
@@ -1688,7 +1705,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         w_m = len(name) * size * 0.52 * m_per_pt
         h_m = size * 1.25 * m_per_pt
         if bullets:
-            w_m = max(w_m, len(bullets) * 15 * m_per_pt)
+            w_m = max(w_m, bullet_w(bullets, sid) * m_per_pt)
             h_m += 17 * m_per_pt
         best = None
         for ang in range(0, 360, 22):
@@ -1717,14 +1734,21 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         # text aligned towards the stop: a name left of its stop ends at the stop's side of the box
         tx = {"left": bb.bounds[0], "right": bb.bounds[2], "center": (bb.bounds[0] + bb.bounds[2]) / 2}[ha]
         ax.text(tx, ty, name, fontproperties=font(size), color=INK, ha=ha, va="center", path_effects=halo, zorder=7)
-        row_w = len(bullets) * 15 * m_per_pt
+        row_w = bullet_w(bullets, sid) * m_per_pt
         bx0 = {"left": tx, "right": tx - row_w, "center": tx - row_w / 2}[ha]
-        for k, (l, mk) in enumerate(bullets):  # lines ending here: bullets under the name (diamond: variant)
-            bx = bx0 + (k * 15 + 7) * m_per_pt
+        xo = 0.0
+        for l, mk in bullets:  # lines ending here: bullets under the name (diamond: variant, with its trips a day)
+            bx = bx0 + (xo + 7) * m_per_pt
             by = ty - (size * 0.62 + 9) * m_per_pt
             ax.scatter([bx], [by], marker=mk, s=(13 if mk == "o" else 11.5) ** 2, color=colors.get(l, "#888"),
                        zorder=7, linewidths=0)
             ax.text(bx, by, l, fontproperties=font(8), color="white", ha="center", va="center", zorder=7.1)
+            xo += 15
+            if mk == "D":
+                n_ = stations[sid]["trips"].get(l, 0)
+                ax.text(bx + 8 * m_per_pt, by, f"{n_}", fontproperties=font(8.5), color="#666", ha="left",
+                        va="center", zorder=7.1, path_effects=halo)
+                xo += 4 + 5.2 * len(str(n_))
 
     street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt)
 
@@ -1752,15 +1776,25 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     ky = top - row * (len(order) - 0.4) - row * 0.9
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
     key_rows = [("dot", "przystanek"), ("arrow", "przystanek w jednym kierunku jazdy"),
-                ("dash", "wydłużenia: mniej niż 1/4 kursów linii")]
+                ("dash", "wydłużenia: mniej niż 1/4 kursów linii"),
+                ("diamond", "koniec wydłużenia, obok: kursów linii na dobę")]
+    kl = lw * 2.2                                   # key drawn larger than on the map, to be legible
     for k, (kind, text) in enumerate(key_rows):
         y = ky - k * row * 0.75
-        draw_line(ax, np.array([[kx0, y], [kx1, y]]), "#8a8a8a", lw, kind == "dash", zorder=9)
-        if kind == "dot":
-            ax.scatter([(kx0 + kx1) / 2], [y], s=(lw * 0.7) ** 2, color=INK, zorder=9.5, linewidths=0)
-        elif kind == "arrow":
-            ax.scatter([(kx0 + kx1) / 2], [y], marker=(3, 0, -90), s=(lw * 1.35) ** 2, color=INK, zorder=9.5,
+        xm = (kx0 + kx1) / 2
+        if kind == "diamond":
+            ax.scatter([xm - (kx1 - kx0) * 0.18], [y], marker="D", s=21 ** 2, color="#8a8a8a", zorder=9.5,
                        linewidths=0)
+            ax.text(xm - (kx1 - kx0) * 0.18, y, "E", fontproperties=font(12), color="white", ha="center",
+                    va="center", zorder=9.6)
+            ax.text(xm - (kx1 - kx0) * 0.18 + 18 / pt_per_m, y, "4", fontproperties=font(13), color="#666", ha="left",
+                    va="center", zorder=9.6)
+        else:
+            draw_line(ax, np.array([[kx0, y], [kx1, y]]), "#8a8a8a", kl, kind == "dash", zorder=9)
+        if kind == "dot":
+            ax.scatter([xm], [y], s=(kl * 0.7) ** 2, color=INK, zorder=9.5, linewidths=0)
+        elif kind == "arrow":
+            ax.scatter([xm], [y], marker=(3, 0, -90), s=(kl * 1.35) ** 2, color=INK, zorder=9.5, linewidths=0)
         ax.text(px0 + pw * 0.13, y, text, fontproperties=font(13), color=INK, va="center", zorder=9)
     print(f"one-way stop arrows: {n_arrows}")
     ax.text(x0 + (x1 - x0) * 0.01, y0 + (y1 - y0) * 0.012,
