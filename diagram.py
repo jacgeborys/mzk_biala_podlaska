@@ -893,13 +893,16 @@ def node_cost(inc, orders, edges, node=None):
                 entry = hp + math.pi                     # direction of travel into the node along p
                 la, lb = -left_of(orders, p, a, sp), -left_of(orders, p, b, sp)
                 (ha, sa), (hb, sb) = ea[qa], eb[qb]
+                # a line joining from a street of its own (a precise section, G) crossing there counts double:
+                # it joins the bundle on its own side and the crossing moves along the bundle
+                wx = 2 if any(is_precise(edges[x_]) for x_ in (qa, qb)) else 1
                 if qa == qb:                             # on together: left/right must stay
                     if (la > lb) != (left_of(orders, qa, a, sa) > left_of(orders, qa, b, sb)):
-                        crossings += 1
+                        crossings += wx
                 else:                                    # split: the line turning further left keeps left
                     ta, tb = turn(entry, ha), turn(entry, hb)
                     if abs(ta - tb) > 0.05 and (la > lb) != (ta > tb):
-                        crossings += 1
+                        crossings += wx
     return (cost + crossings) * NODE_W.get(node, 1.0)
 
 
@@ -1229,8 +1232,10 @@ def relax_junction_corners(edges, orders):
                         v = len(c_) - 2                                    # the vertex next to n ...
                         w1, w2 = c_[v] - c_[v - 1], c_[v + 1] - c_[v]
                         cv = np.dot(w1, w2) / (np.hypot(*w1) * np.hypot(*w2) + 1e-9)
-                        if cv < math.cos(math.radians(45)) and np.hypot(*(c_[v] - c_[-1])) > 250:
+                        if cv < math.cos(math.radians(45)) and (np.hypot(*(c_[v] - c_[-1])) > 250 or len(e_["lines"]) <= 4):
                             # ... unless it is a real street corner away from the junction (G onto al. Jana Pawła II,
+                            # or any street corner of a bundle of up to 4 lines: B, E, G, L north on al. Tysiąclecia
+                            # then into Brzeska, so they do not cut through the neighbourhood;
                             # 456 m on): that one is only eased, pulled CORNER_EASE of the way towards the chord of its
                             # neighbours, once
                             if not e_.get("eased"):
