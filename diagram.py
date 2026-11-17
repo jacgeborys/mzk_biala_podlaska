@@ -1445,7 +1445,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         dv_ = tip - prev
         dv_ = dv_ / max(np.hypot(*dv_), 1e-9)
         st_ = -((tip - base) @ t) / (dv_ @ t) if abs(dv_ @ t) > 0.3 else -1
-        if 0 <= st_ <= (100 if k in shifted else 60):
+        if 0 <= st_ <= (250 if k in shifted else 60):
             p = tip + dv_ * st_
             if abs((p - base) @ nrm) <= 4 * SPACING + 40:
                 if at_end:
@@ -1487,7 +1487,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     # Jana III Sobieskiego, curving north past the trunk's end): the station line stays square across the road and
     # is slid along it to where that line's curve runs exactly one lane outside the outermost line ending there on
     # its side (C next to G), so the capsule reaches out to it as one bar
-    def crossings(c, b0, t_):
+    def crossings(c, b0, t_, across=False):
         """Positions across the road (along nrm) where the drawn polyline c crosses the line through b0 square to t_."""
         n_ = np.array([-t_[1], t_[0]])
         sv = (c - b0) @ t_
@@ -1496,6 +1496,10 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             if sv[j - 1] == 0 or np.sign(sv[j - 1]) != np.sign(sv[j]):
                 f = sv[j - 1] / (sv[j - 1] - sv[j]) if sv[j - 1] != sv[j] else 0
                 q = c[j - 1] + (c[j] - c[j - 1]) * f
+                if across:                                     # only where the line runs across the road
+                    d_ = c[j] - c[j - 1]
+                    if abs(d_ @ t_) > 0.7 * np.hypot(*d_):
+                        continue
                 out.append((float((q - b0) @ n_), q))
         return out
 
@@ -1504,31 +1508,35 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         ending = stations[k]["term"] & edges[i]["lines"]
         if not extra or not ending:
             continue
-        nrm_ = np.array([-t[1], t[0]])
+        # the road's direction over its last 150 m into the junction (not the last few metres, which may bend)
+        g_ = edges[i]["geom"]
+        node = min((edges[i]["u"], edges[i]["v"]), key=lambda n: np.hypot(*(np.array(n) - base)))
+        back = np.array(g_.interpolate(150 if edges[i]["u"] == node else g_.length - 150).coords[0])
+        t = np.array(node) - back
+        t /= np.hypot(*t)
+        base = np.array(node, float)
+        # where the lines ending there cross the road 40 m before the junction (they run straight on from there: past
+        # the junction they are carried on along the road to wherever the capsule goes)
+        hit0 = {l: x for l, _, _, _, c, _, _ in chains if l in ending
+                for x, _ in crossings(c, base - t * 40, t) if abs(x) < 4 * SPACING + 60}
+        if set(hit0) != ending:
+            continue
+        ends_x = list(hit0.values())
+        up = t                                                     # along the road, past the junction (north)
         best = None
-        for s_ in np.arange(-150, 151, 2.0):
-            b0 = base + t * s_
-            hit = {l: x for l, _, _, _, c, _, _ in chains if l in ending
-                   for x, _ in crossings(c, b0, t) if abs(x) < 4 * SPACING + 60}
-            if set(hit) != ending:                                 # every line ending there must reach it
-                continue
-            ends_x = list(hit.values())
+        for s_ in np.arange(-40, 301, 2.0):                          # as far along the road as C still fits by G
+            b0 = base + up * s_
             for l, _, _, _, c, _, _ in chains:
                 if l not in extra:
                     continue
-                for x, q in crossings(c, b0, t):
-                    if abs(x) > 6 * SPACING + 80:
+                for x, q in crossings(c, b0, t, across=True):     # C coming in across the road, not its leg north
+                    gap = (x - max(ends_x)) if x > max(ends_x) else (min(ends_x) - x) if x < min(ends_x) else -1
+                    if gap < 0:
                         continue
-                    if x > max(ends_x):                            # outside the bundle on the + side
-                        gap = x - max(ends_x)
-                    elif x < min(ends_x):
-                        gap = min(ends_x) - x
-                    else:
-                        continue
-                    sc = abs(gap - SPACING) + 0.05 * abs(s_)
-                    if best is None or sc < best[0]:
+                    sc = abs(gap - SPACING) - 0.15 * s_            # C one lane beyond G, as far north as possible
+                    if abs(gap - SPACING) < 0.7 * SPACING and (best is None or sc < best[0]):
                         best = (sc, b0, q)
-        if best is not None and best[0] < SPACING:
+        if best is not None:
             shifted[k] = (best[1], best[2], t)
 
     tilted = {}
@@ -1577,6 +1585,10 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                     sch[i] = float(n_ < EXT_SHARE * line_trips[l])
             forced = np.array([sch.get(i, np.nan) for i in E])
             ext = extension_mask(Q, shapes.get(l, []), line_trips[l], forced)
+            for k_, (b2, apex, t2) in shifted.items():           # a line meeting a moved capsule's tip (C at
+                if l in stations[k_]["term"]:                     # Terebelska Pętla) is solid up to the capsule
+                    near_ = (np.hypot(*(c - apex).T) < 110) & ((c - b2) @ t2 < 0)
+                    ext[near_] = False
             cut = [0] + [k for k in range(1, len(c)) if ext[k] != ext[k - 1]] + [len(c)]
             for a_, b_ in zip(cut, cut[1:]):
                 part = c[max(a_ - 1, 0):b_]
