@@ -2240,16 +2240,15 @@ STREET_LABELS = {
     "Orzechowa": "Orzechowa", "Aleja Solidarności": "al. Solidarności", "Akademicka": "Akademicka",
     "Łomaska": "Łomaska", "Francuska": "Francuska", "Białka": "Białka", "Królowej Jadwigi": "Królowej Jadwigi",
     "Podleśna": "Podleśna", "Lubelska": "Lubelska",
-    "Sitnicka": "Sitnicka", "Jana III Sobieskiego": "Sobieskiego", "Robotnicza": "Robotnicza",
+    "Sitnicka": "Sitnicka", "Robotnicza": "Robotnicza",
     "Armii Krajowej": "Armii Krajowej", "Koncertowa": "Koncertowa", "Aleja Riada Haidara": "al. Haidara",
 }
 STREET_SIZE, STREET_COLOR = 10.5, "#8e8e8e"
 STREET_NEAR_CENTRE = {"Sidorska", "Francuska", "Lubelska", "Janowska"}
 OFFSET_OK = set()   # street names allowed further out from their bundle
 # names placed by hand (map x, y, angle): where the drawn lines run off the street (C / K on Sobieskiego)
-STREET_MANUAL = {"Jana III Sobieskiego": (781985, 472605, 0.0)}
-STREET_PIN = {"Zamkowa": (782262, 471235), "Gabriela Narutowicza": (782680, 470833),
-              "Jana III Sobieskiego": (782190, 472702)}  # names kept here (user)
+STREET_MANUAL = {}
+STREET_PIN = {"Zamkowa": (782262, 471235), "Gabriela Narutowicza": (782680, 470833)}  # names kept here (user)
 
 
 def street_labels(ax, edges, orders, occ, occ_tree, placed, frame, m_per_pt):
