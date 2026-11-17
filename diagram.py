@@ -64,7 +64,7 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
-CORNER_EASE = 0.7   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
+CORNER_EASE = 0.0   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
 TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
@@ -587,7 +587,8 @@ def _fold_once(edges):
     return chain_edges(out), folded
 
 
-HAIRPINS = {"G": "Narutowicza"}   # line -> stop at the tip of its hairpin next to a junction (drawn tight)
+HAIRPINS = {}      # line -> stop at the tip of its hairpin next to a junction (drawn tight beside the bundle); G
+#                   was here until 2026-11-17, now follows its real route
 HAIRPIN_ALONG_M = 330  # ... it runs this far beside the bundle it comes back to
 
 
