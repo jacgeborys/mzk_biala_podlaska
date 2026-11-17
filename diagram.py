@@ -55,7 +55,7 @@ CORNER_R = 150      # m: corners become circular arcs of this radius (smaller wh
 EXACT_TURNS = True    # a lane that would fold at a tight junction corner is redrawn lane to lane (exact_turns)
 LANE_CHANGE_SIDE = False  # lane changes at a junction on the side with fewer lines (off: centred; it pushed G under E on al. Tysiąclecia)
 SPUR_RAMP_M = 300   # lane changes onto / off the Dworzec PKP spur (--station spur) ease over this length
-FIX = {"e_bridge", "l_bridge", "diamonds"}   # preview switches for the overlap fixes (user judges them): spur_east, e_bridge, l_bridge, diamonds
+FIX = {"e_bridge", "l_bridge"}   # preview switches for the overlap fixes (user judges them): spur_east, e_bridge, l_bridge, diamonds
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
@@ -2155,6 +2155,12 @@ def station_spots(stations, edges):
         g = geoms[i]
         d = g.project(pt)
         h = heading_at(g, d)
+        if i in _SECTIONS and len(_SECTIONS[i]) >= 2 and min(d, g.length - d) < 80:
+            # near a section's end (a dead end with a turning loop, Brzegowa - Baza): the direction of the section
+            # as drawn there, not of the raw street's last wiggle
+            ds_ = LineString(_SECTIONS[i])
+            q_ = ds_.project(pt)
+            h = heading_at(ds_, min(max(q_, 40), ds_.length - 40))
         spots[sid] = (i, np.array(g.interpolate(d).coords[0]), np.array([math.cos(h), math.sin(h)]),
                       s["lines"] & edges[i]["lines"])
     return spots
@@ -2349,13 +2355,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         wherever its drawing happens to end (Terebelska Pętla had six end bars scattered round a corner).
         Returns (c, E, Q, station or None)."""
         xy = c[-1] if at_end else c[0]
-        cand = [k for k, s_ in stations.items() if l in s_["term"] and k in spots
-                and np.hypot(*(s_["xy"] - xy)) < 300]
+        cand = [k for k, s_ in stations.items() if k in spots and np.hypot(*(s_["xy"] - xy)) < 300
+                and (l in s_["term"] or k in END_STATIONS.get((l, clean_stop(s_["name"])), {}))]
         if not cand:
             return c, E, Q, None
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))
-        if pale_end(l, k):                        # a pale end (an extension): diamond, not cut at a capsule
-            return c, E, Q, None
         _, base, t, _ = spots[k]
         if k in shifted:                          # the station line moved to the arc's peak, level (see below)
             base, _, t = shifted[k]
@@ -2651,10 +2655,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     # line ends: at a main terminus of the line an end bar, at the end of an extended variant a white diamond
     ends_at = defaultdict(set)                    # station -> lines whose drawing ends there
     var_end = defaultdict(set)                    # station -> lines whose extended variant ends there
-    diamonds_at = []
     for l, xy, d, cut_at in line_ends:
         if cut_at is not None:                    # cut flush at its terminus: the station capsule marks the end
             ends_at[cut_at].add(l)
+            if pale_end(l, cut_at) or l not in stations[cut_at]["term"]:
+                var_end[cut_at].add(l)            # an extension's end: diamond bullet in the name only
             continue
         cand = [k for k, s_ in stations.items() if l in s_["lines"] and np.hypot(*(s_["xy"] - xy)) < 250]
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy))) if cand else None
@@ -2663,22 +2668,11 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         # no end mark where the line turns at Dworzec PKP (it gets its own capsule)
         if any(s_["name"] in KEY_STATIONS and np.hypot(*(s_["xy"] - xy)) < 80 for s_ in stations.values()):
             continue
-        if k is not None and l in stations[k]["term"] and not pale_end(l, k):
-            nrm = np.array([-d[1], d[0]])
-            capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
-        else:
+        nrm = np.array([-d[1], d[0]])               # every line end: a bar (diamonds only in name bullets)
+        capsule(xy - nrm * SPACING * 0.5, xy + nrm * SPACING * 0.5)
+        if not (k is not None and l in stations[k]["term"] and not pale_end(l, k)):
             if k is not None:
                 var_end[k].add(l)
-            if "diamonds" in FIX:       # another diamond already here: this one back along its line
-                st_xy = [spots[k][1]] if k in spots and len(stations[k]["lines"]) > 1 else []
-                for _ in range(8):     # clear of other diamonds and of the station mark
-                    if not any(np.hypot(*(xy - q_)) < SPACING * 1.6 for q_ in diamonds_at) and                             not any(np.hypot(*(xy - q_)) < SPACING * 1.3 for q_ in st_xy):
-                        break
-                    xy = xy - d * SPACING * 0.8
-                diamonds_at.append(xy)
-            ax.scatter([xy[0]], [xy[1]], marker="D", s=(lw * 1.45) ** 2, facecolor="white",
-                       edgecolor=colors.get(l, "#888"), linewidths=lw * 0.38, zorder=5.2)
-            drawn.append(Point(xy).buffer(SPACING * 0.6))
 
     # names: termini only (main termini of a line with round bullets, ends of extended variants with diamond
     # bullets, and Dworzec PKP); every other stop is a dot on its lines
