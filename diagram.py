@@ -55,6 +55,7 @@ CORNER_R = 150      # m: corners become circular arcs of this radius (smaller wh
 EXACT_TURNS = True    # a lane that would fold at a tight junction corner is redrawn lane to lane (exact_turns)
 LANE_CHANGE_SIDE = False  # lane changes at a junction on the side with fewer lines (off: centred; it pushed G under E on al. Tysiąclecia)
 SPUR_RAMP_M = 300   # lane changes onto / off the Dworzec PKP spur (--station spur) ease over this length
+FIX = set()   # preview switches for the overlap fixes (user judges them): spur_east, e_bridge, l_bridge, diamonds
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
@@ -1712,6 +1713,10 @@ def bridge_lanes(seq, l, edges, orders, c, E, Q):
             o_b = lane(orders, ib, l) * (1 if edges[ib]["u"] == n else -1)
             p1 = sa[-1] + np.array([-d1[1], d1[0]]) * o_a - d1 * min(150.0, 0.5 * la)
             p2 = sb[1] + np.array([-d2[1], d2[0]]) * o_b + d2 * min(180.0, 0.5 * lb)
+            if "l_bridge" in FIX:       # end on the short piece, before the next corner (B's arc there kept clear)
+                d2 = sb[1] - sb[0]
+                d2 = d2 / max(np.hypot(*d2), 1e-9)
+                p2 = sb[1] + np.array([-d2[1], d2[0]]) * o_b - d2 * 60
             ka = [k for k in range(len(c)) if E[k] == ia]
             kb = [k for k in range(len(c)) if E[k] == ib]
             if ka and kb:
@@ -1768,6 +1773,8 @@ def hold_inner_lanes(edges, orders):
                     o_a = lane(orders, a, l) * (1 if edges[a]["v"] == n else -1)   # left of travel into n
                     o_b = lane(orders, b, l) * (1 if edges[b]["u"] == n else -1)   # left of travel out of n
                     if turn * o_a > 0 and turn * o_a - turn * o_b > 1.5 * SPACING:
+                        if "e_bridge" in FIX and l == "E":
+                            continue            # E: drawn as the bundle (no bridge pressing it against B)
                         BRIDGE.setdefault((a, b, n), set()).add(l)
 
 
@@ -1881,6 +1888,12 @@ def draw_path(seq, l, edges, orders):
     if U_INFO.get("spur") and any("down_dir" in edges[i] for i, _ in seq):    # only near the spur's top
         d_ = np.hypot(*(Q - np.array(U_INFO["node"])).T)
         w_ = np.clip((450 - d_) / 150, 0, 1)
+        if "spur_east" in FIX:      # not where a line turns off the east leg (A onto Sidorska east): its turn is exact
+            w_ = w_ * np.array([0.0 if (e_ == U_INFO["right"] or edges[e_].get("u_turn_arm") and
+                                        edges[e_]["geom"].distance(Point(U_INFO["node"])) < 1 and
+                                        np.dot(np.array(edges[e_]["geom"].centroid.coords[0]) - np.array(U_INFO["node"]),
+                                               U_INFO["perp"]) > 0) else 1.0 for e_ in E])
+            w_ = smooth(w_[:, None], 60)[:, 0]
         O = O * (1 - w_) + smooth(O2[:, None], SPUR_RAMP_M)[:, 0] * w_
     t = np.gradient(Q, axis=0)
     t = smooth(t, STEP_M * 3)
@@ -2600,6 +2613,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     # line ends: at a main terminus of the line an end bar, at the end of an extended variant a white diamond
     ends_at = defaultdict(set)                    # station -> lines whose drawing ends there
     var_end = defaultdict(set)                    # station -> lines whose extended variant ends there
+    diamonds_at = []
     for l, xy, d, cut_at in line_ends:
         if cut_at is not None:                    # cut flush at its terminus: the station capsule marks the end
             ends_at[cut_at].add(l)
@@ -2617,6 +2631,12 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         else:
             if k is not None:
                 var_end[k].add(l)
+            if "diamonds" in FIX:       # another diamond already here: this one back along its line
+                for _ in range(6):
+                    if not any(np.hypot(*(xy - q_)) < SPACING * 1.6 for q_ in diamonds_at):
+                        break
+                    xy = xy - d * SPACING * 0.8
+                diamonds_at.append(xy)
             ax.scatter([xy[0]], [xy[1]], marker="D", s=(lw * 1.45) ** 2, facecolor="white",
                        edgecolor=colors.get(l, "#888"), linewidths=lw * 0.38, zorder=5.2)
             drawn.append(Point(xy).buffer(SPACING * 0.6))
