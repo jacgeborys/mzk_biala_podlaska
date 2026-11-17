@@ -56,11 +56,12 @@ EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension t
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
 DASH_ON, DASH_OFF = 4.0, 0.55   # extensions: dash / gap length in line widths
 EXT_SHARE = 0.25    # where a line runs with under this share of its trips of the day it is an extension (dashed)
-U_DEPTH_M = 520      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
+U_DEPTH_M = 640      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
-U_TOP_M = 170        # ... over which the legs reach their place below the crossing
+U_TOP_M = 300        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
+U_EASE_M = 170       # ... then move apart to their place over this length
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -504,21 +505,29 @@ def station_access(edges, stations):
         ss = lambda t: t * t * (3 - 2 * t)  # noqa: E731
         down = u_lines | kos_lines | end_lines
 
-        def leg(sign):
-            # a few long straight pieces (diagonal off the crossing, straight down), so that the corners, the one
-            # at the crossing included, are rounded with full-size arcs; the bottom is a half circle
-            top = [P0, P0 + dv * U_TOP_M + sign * perp * U_HALF_M]
+        def leg(sign, sh):
+            # one long straight piece down from the crossing (so the arms turning into it get full-size arcs), a
+            # smooth move outwards to the leg's place, straight down, a half circle at the bottom. Returns the points
+            # and, per point, the bundle shift: at the top the two legs run side by side as one bundle continuing
+            # Al. 1000-lecia (each pushed outwards by half the other's width), eased out as the legs move apart
+            ts = np.linspace(0, 1, 12)[1:]
+            ease = [P0 + dv * (U_TOP_M + U_EASE_M * t) + sign * perp * U_HALF_M * ss(t) for t in ts]
             arc = [C + sign * perp * U_HALF_M * math.cos(a) + dv * U_HALF_M * math.sin(a)
                    for a in np.linspace(0, math.pi / 2, 19)]
-            return [tuple(p) for p in top + arc]
+            prof = [sh, sh] + [sh * (1 - ss(t)) for t in ts] + [0.0] * len(arc)
+            return [tuple(p) for p in [P0, P0 + dv * U_TOP_M] + ease + arc], prof
         keep = [f for k, f in enumerate(out) if k != i]
-        lg = leg(-1)
-        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True, probe_m=U_TOP_M,
-                         trips=tr(down)))
+        nL, nR = len(down), len(u_lines)
+        # shift: metres left of the edge's direction (left leg: down, so west is negative; right leg: up, so east
+        # is negative)
+        lg, lprof = leg(-1, -nR * SPACING / 2)
+        probe = U_TOP_M + U_EASE_M                                   # headings measured where the legs are apart
+        keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
+                         probe_m=probe, trips=tr(down), shift_prof=lprof))
         if u_lines:
-            rg = leg(1)[::-1]
-            keep.append(dict(geom=LineString([tuple(Sx)] + rg[1:-1] + [N2]), lines=u_lines, u=key(Sx), v=N2,
-                             raw=True, probe_m=U_TOP_M, trips=tr(u_lines)))
+            rg, rprof = leg(1, -nL * SPACING / 2)
+            keep.append(dict(geom=LineString([tuple(Sx)] + rg[::-1][1:-1] + [N2]), lines=u_lines, u=key(Sx), v=N2,
+                             raw=True, probe_m=probe, trips=tr(u_lines), shift_prof=rprof[::-1]))
         if kos_lines:
             kc = int(np.argmax([LineString([thr_c[0], thr_c[-1]]).distance(Point(p)) for p in thr_c]))
             corner = thr_c[kc]
@@ -551,6 +560,10 @@ def station_access(edges, stations):
                 continue
             w_arm, e_arm = sorted(arms, key=east)
             PAIRS[(l, N2)] = {left_k: w_arm, w_arm: left_k, right_k: e_arm, e_arm: right_k}
+        for k, f in enumerate(out):                                   # arms: shifted where they join the legs
+            if N2 in (f["u"], f["v"]) and k not in (left_k, right_k):
+                f["split_at"] = (N2, U_TOP_M)
+        U_INFO.update(node=N2, left=left_k, right=right_k)
         NODE_W[key(Sx)] = STATION_CROSS_W
         NODE_W[N2] = ABOVE_CROSS_W
         print(f"{name}: U {sorted(u_lines)}, on along Kościuszki {sorted(kos_lines)}, ending at the station "
@@ -754,6 +767,16 @@ def section_coords(e, width):
         if wi is None:
             break
         c = np.delete(c, wi, axis=0)
+    if e.get("split_at"):                       # an extra vertex this far from that end (the arm's shifted piece)
+        node, dist = e["split_at"]
+        rev = tuple(np.round(c[0], 1)) != tuple(np.round(node, 1)) and             np.hypot(*(c[-1] - np.array(node))) < np.hypot(*(c[0] - np.array(node)))
+        cc = c[::-1] if rev else c
+        sd = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(cc, axis=0), axis=1))])
+        if sd[-1] > dist + 60:
+            k = int(np.searchsorted(sd, dist))
+            f = (dist - sd[k - 1]) / (sd[k] - sd[k - 1])
+            cc = np.insert(cc, k, cc[k - 1] + f * (cc[k] - cc[k - 1]), axis=0)
+            c = cc[::-1] if rev else cc
     return c
 
 
@@ -858,7 +881,36 @@ def extension_mask(Q, shapes, total):
 
 _SECTIONS = {}
 PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
+U_INFO = {}     # the Dworzec PKP U: crossing node, left / right leg edges
 NODE_W = {}     # node -> weight of crossings there (crossings under the station bar are cheap)
+
+
+def arm_shifts(edges, orders):
+    """Arms meeting the U at the crossing approach it already shifted to where their lines go on the legs (lane
+    offsets left of travel kept through the turn), so every lane turns on a concentric arc instead of folding
+    round the crossing point: e["end_shift"] = (node, metres left of the edge's direction)."""
+    if not U_INFO:
+        return
+    N2, lk, rk = U_INFO["node"], U_INFO["left"], U_INFO["right"]
+
+    def leg_x(k, l):                            # lane position at the crossing, across Al. 1000-lecia (east +)
+        if k == lk:
+            return lane(orders, k, l) + edges[k]["shift_prof"][0]
+        return -(lane(orders, k, l) + edges[k]["shift_prof"][-1])
+    for k, e in enumerate(edges):
+        if "split_at" not in e:
+            continue
+        d = []
+        for l in e["lines"]:
+            pr = PAIRS.get((l, N2))
+            leg = pr[k] if pr and k in pr else lk if l in edges[lk]["lines"] else rk if l in edges[rk]["lines"] else None
+            if leg is None:
+                continue
+            lo = lane(orders, k, l) * (1 if e["v"] == N2 else -1)   # left of travel towards the crossing
+            d.append(leg_x(leg, l) - lo)
+        if d:
+            sh = float(np.mean(d))
+            e["end_shift"] = (N2, sh if e["v"] == N2 else -sh)
 
 
 def draw_path(seq, l, edges, orders):
@@ -871,10 +923,18 @@ def draw_path(seq, l, edges, orders):
             _SECTIONS[i] = section_coords(edges[i], len(orders[i]))
         c = _SECTIONS[i] if fwd else _SECTIONS[i][::-1]
         o = lane(orders, i, l) * (1 if fwd else -1)
+        offs = np.full(len(c), o)                   # per point: offset of the segment ending there
+        if "end_shift" in edges[i] and len(c) > 1:  # an arm of the U: its last piece shifted
+            node, sh = edges[i]["end_shift"]
+            at_start = (edges[i]["u"] if fwd else edges[i]["v"]) == node
+            offs[1 if at_start else len(c) - 1] += sh * (1 if fwd else -1)
+        if "shift_prof" in edges[i]:                # whole bundle shifted (the U's legs, side by side at the top)
+            pr = np.array(edges[i]["shift_prof"], float)
+            offs = offs + (pr if fwd else -pr[::-1])
         if pts:
-            c = c[1:]
+            c, offs = c[1:], offs[1:]
         pts.extend(c)
-        seg_off.extend([o] * len(c))
+        seg_off.extend(offs)
         seg_edge.extend([i] * len(c))
     P = np.array(pts)
     seg_off = np.array(seg_off[1:] if len(seg_off) > 1 else seg_off, dtype=float)  # offset of segment k: P[k]-P[k+1]
@@ -1226,6 +1286,7 @@ def main():
     edges = station_access(edge_trips(edges, geoms, n_shape, line_of), stations)
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
+    arm_shifts(edges, orders)
     shapes = defaultdict(list)                   # line -> [(shape, trips of the day)], for the dashed extensions
     for sid, g in geoms.items():
         shapes[line_of[sid]].append((g, int(n_shape[sid])))
