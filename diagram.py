@@ -84,6 +84,9 @@ LAND, WATER, GREEN, INK = "#f5f2ea", "#a9cde6", "#d9e8cf", "#1d1d1f"
 DAY_NAMES = ["poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela"]
 
 
+SHORT_WORKINGS = set()   # (line, end): short turns at Dworzec PKP on the line's main route, not in the legend
+EXT_SIDE = {}       # (line, variant end) -> the main terminus it lies beyond
+LOOP_STREETS = {"L": "Francuska – Armii Krajowej – Okopowa – Akademicka – Narutowicza"}
 LINE_ENDS = {}      # line -> {terminus name: trip starts + ends}, for the legend
 EXT_MIN_ENDS = 3    # legend: variant ends with fewer trip starts + ends are not listed
 
@@ -94,19 +97,18 @@ def clean_stop(n):
 
 
 def legend_name(l, fallback):
-    """(main, extensions): the two termini with most trip starts + ends, then the other variant ends."""
+    """(left terminus, right terminus, variant ends beyond the left one, beyond the right one); a circular line
+    (one terminus): ("Linia okrężna", None, its streets, "")."""
     ends = sorted(LINE_ENDS.get(l, {}).items(), key=lambda kv: -kv[1])
-    if not ends:
-        return fallback, ""
-    if len(ends) == 1:                              # a circular line (L): one terminus
-        return f"{ends[0][0]} (okrężna)", fallback.split("  ", 1)[-1].replace(" – ", ", ")
-    main = f"{ends[0][0]} – {ends[1][0]}"
-    ext = [n for n, c in ends[2:] if c >= EXT_MIN_ENDS]
-    txt = ("też: " + ", ".join(ext)) if ext else ""
-    while len(txt) > 64 and len(ext) > 1:                 # fits the legend panel; the rarest are left out
-        ext = ext[:-1]
-        txt = "też: " + ", ".join(ext) + " …"
-    return main, txt
+    if len(ends) < 2:
+        return "Linia okrężna", None, LOOP_STREETS.get(l, fallback.split("  ", 1)[-1]), ""
+    t1, t2 = ends[0][0], ends[1][0]
+    ext = [n for n, c in ends[2:] if c >= EXT_MIN_ENDS and (l, n) not in SHORT_WORKINGS]
+    left = [n for n in ext if EXT_SIDE.get((l, n)) == t1]
+    right = [n for n in ext if n not in left]
+    if len(left) > len(right):                      # the side with more variant ends on the right (more room)
+        t1, t2, left, right = t2, t1, right, left
+    return t1, t2, ", ".join(left), ", ".join(right)
 
 
 def font(size):
@@ -169,6 +171,48 @@ def load(date):
     first_last["nm"] = first_last.stop_id.map(stops.set_index("stop_id").stop_name).map(clean_stop)
     for l, g in first_last.groupby("route_id"):
         LINE_ENDS[l] = g.nm.value_counts().to_dict()        # trip starts + ends per terminus name
+    # which main terminus each other variant end lies beyond: the main terminus its trips pass (nearest to it in
+    # the stop sequence); a trip passing neither (a short working) goes on the side away from its other end
+    # (full stop names here: once cleaned, "Sidorska 5" and the terminus "Sidorska Pętla" would be one)
+    st["raw"] = st.stop_id.map(stops.set_index("stop_id").stop_name)
+    first_last["raw"] = first_last.stop_id.map(stops.set_index("stop_id").stop_name)
+    seqs = st.sort_values("seq").groupby("trip_id").raw.apply(list)
+    trip_line = day.set_index("trip_id").route_id
+    lx, ly = tr.transform(stops.stop_lon.astype(float).values, stops.stop_lat.astype(float).values)
+    stop_xy = {}
+    for n_, x_, y_ in zip(stops.stop_name, lx, ly):
+        stop_xy.setdefault(n_, np.array([x_, y_]))
+    main_stops = defaultdict(set)                         # stops of the trips between a line's two main termini
+    for tid, seq in seqs.items():
+        l = trip_line[tid]
+        main = [n for n, _ in sorted(LINE_ENDS[l].items(), key=lambda kv: -kv[1])[:2]]
+        if {clean_stop(seq[0]), clean_stop(seq[-1])} == set(main):
+            main_stops[l] |= set(seq[1:-1])
+    votes = defaultdict(lambda: defaultdict(int))
+    for tid, seq in seqs.items():
+        l = trip_line[tid]
+        main = [n for n, _ in sorted(LINE_ENDS[l].items(), key=lambda kv: -kv[1])[:2]]
+        if len(main) < 2:
+            continue
+        fl_l = first_last[first_last.route_id == l]
+        main_raw = {m: set(fl_l[fl_l.nm == m].raw) for m in main}
+        for at_start in (True, False):
+            x, other = (seq[0], seq[-1]) if at_start else (seq[-1], seq[0])
+            if clean_stop(x) in main:
+                continue
+            pos, opos = (0, len(seq) - 1) if at_start else (len(seq) - 1, 0)
+            passed = [(abs(i - pos), m) for i, n in enumerate(seq) if i not in (pos, opos)
+                      for m in main if n in main_raw[m]]
+            if x in main_stops.get(l, set()) and x in KEY_STATIONS:
+                SHORT_WORKINGS.add((l, clean_stop(x)))         # a short turn at Dworzec PKP: not an extension
+                continue
+            if passed:
+                side = min(passed)[1]
+            else:                                              # else the main terminus nearest to it
+                side = min(main, key=lambda m: min(np.hypot(*(stop_xy[r] - stop_xy[x])) for r in main_raw[m]))
+            votes[(l, clean_stop(x))][side] += 1
+    for (l, x), v in votes.items():
+        EXT_SIDE[(l, x)] = max(v, key=v.get)
     return geoms, n_shape, line_of, stations, line_trips
 
 
@@ -544,8 +588,7 @@ def _fold_once(edges):
 
 
 HAIRPINS = {"G": "Narutowicza"}   # line -> stop at the tip of its hairpin next to a junction (drawn tight)
-HAIRPIN_APPROACH_M = 400
-HAIRPIN_GAP = 2.0      # the tip stays this many lanes outside the widest bundle at the junction
+HAIRPIN_ALONG_M = 330  # ... it runs this far beside the bundle it comes back to
 
 
 def hairpin_tips(edges, stations):
@@ -574,17 +617,33 @@ def hairpin_tips(edges, stations):
         j = int(np.argmax(turn)) + 1                          # the hairpin vertex
         if turn[j - 1] < math.radians(90):
             continue
-        leg = LineString([c[j], c[-1]])
-        T = np.array(leg.interpolate(leg.project(S)).coords[0])   # tip: the stop on the way back ...
-        half = max(len(f["lines"]) for f in edges if node in (f["u"], f["v"])) * SPACING / 2
-        dT = np.hypot(*(T - c[-1]))
-        T = c[-1] + (T - c[-1]) * min(1.0, (half + HAIRPIN_GAP * SPACING) / dT)   # ... pulled in near the bundle
-        u = (c[j] - c[j - 1]) / np.hypot(*(c[j] - c[j - 1]))
-        P = T - u * HAIRPIN_APPROACH_M                         # approach parallel to the real one
-        new = [tuple(p) for p in c[:j - 1]] + [tuple(P), tuple(T), tuple(c[-1])]
+        # the bundle it comes back to (al. Tysiąclecia): G runs beside it as the next lane out, touching it, up to
+        # a tip by the junction where the stop is, then into the junction
+        nd = np.array(node)
+        others = [f for q, f in enumerate(edges) if q != k and node in (f["u"], f["v"]) and len(f["lines"]) >= 3]
+        if not others:
+            continue
+        bnd = min(others, key=lambda f: f["geom"].distance(Point(c[j - 1])))
+        bc = section_coords(bnd, len(bnd["lines"]))
+        if np.hypot(*(bc[0] - nd)) > np.hypot(*(bc[-1] - nd)):
+            bc = bc[::-1]                                     # from the junction outwards
+        bl = LineString(bc)
+        off = (len(bnd["lines"]) - 1) / 2 * SPACING + SPACING
+        def along(d):
+            p_ = np.array(bl.interpolate(d).coords[0])
+            q_ = np.array(bl.interpolate(d + 5).coords[0])
+            tg = (q_ - p_) / max(np.hypot(*(q_ - p_)), 1e-9)
+            return p_, np.array([-tg[1], tg[0]])
+        p_, n_ = along(HAIRPIN_ALONG_M)
+        side = 1.0 if (c[j - 1] - p_) @ n_ > 0 else -1.0
+        d0 = off + SPACING                                    # the tip: just clear of the junction's turn
+        run = [along(d)[0] + along(d)[1] * side * off for d in np.linspace(HAIRPIN_ALONG_M, d0, 8)]
+        T = run[-1]
+        new = [tuple(p) for p in c[:j - 1]] + [tuple(q) for q in run] + [tuple(c[-1])]
         g = LineString(new)
         edges[k] = dict(e, geom=g if tuple(np.round(new[0], 1)) == e["u"] or np.hypot(*(np.array(new[0]) - e["u"])) < 1
-                        else LineString(new[::-1]), raw=True)
+                        else LineString(new[::-1]), raw=True, schematic=S,
+                        hug=(next(q for q, f in enumerate(edges) if f is bnd), side, node, len(c[:j - 1])))
         for s_ in sts:
             s_["xy"] = T                                      # the stop dot at the tip
         print(f"hairpin {l} at {name}: tip {np.hypot(*(T - c[-1])):.0f} m from the junction")
@@ -1106,6 +1165,7 @@ def extension_mask(Q, shapes, total, forced=None):
 
 _SECTIONS = {}
 PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
+HUG_TIPS = {}   # edge -> its hairpin tip as drawn (the stop dot goes there)
 JOINS = {}      # (line, node) -> [(edge, edge)]: how a line with 3+ sections at a node is drawn through it
 U_INFO = {}     # the Dworzec PKP U: crossing node, left / right leg edges
 NODE_W = {}     # node -> weight of crossings there (crossings under the station bar are cheap)
@@ -1219,6 +1279,35 @@ def set_joins(edges, shapes):
             if s_:
                 pairs.add(tuple(sorted((i, s_[0]))))
         JOINS[(l, n)] = sorted(pairs)
+
+
+def rebuild_hugs(edges, orders):
+    """The run of a hairpin line beside its bundle (hairpin_tips) redone from the bundle's final drawn centreline
+    (after relax_junction_corners) and its real outermost lane, so it touches the bundle exactly one lane out."""
+    for k, e in enumerate(edges):
+        if "hug" not in e or k not in _SECTIONS:
+            continue
+        bi, side, node, n_keep = e["hug"]
+        nd = np.array(node)
+        bc = _SECTIONS[bi]
+        if np.hypot(*(bc[0] - nd)) > np.hypot(*(bc[-1] - nd)):
+            bc = bc[::-1]
+        bl = LineString(bc)
+        sgn = 1 if np.hypot(*(np.array(edges[bi]["geom"].coords[0]) - nd)) < 1 else -1   # lane sign from the node
+        lanes = [lane(orders, bi, l) * sgn for l in edges[bi]["lines"]]
+        off = (max(lanes) if side > 0 else -min(lanes)) + SPACING
+        def along(d):
+            p_ = np.array(bl.interpolate(d).coords[0])
+            q_ = np.array(bl.interpolate(d + 5).coords[0])
+            tg = (q_ - p_) / max(np.hypot(*(q_ - p_)), 1e-9)
+            return p_ + np.array([-tg[1], tg[0]]) * side * off
+        c = np.array(e["geom"].coords)
+        if np.hypot(*(c[0] - nd)) < np.hypot(*(c[-1] - nd)):
+            c = c[::-1]
+        run = [along(d) for d in np.linspace(HAIRPIN_ALONG_M, off + SPACING, 8)]
+        new = np.array(list(c[:n_keep]) + run + [nd])
+        _SECTIONS[k] = new if np.hypot(*(new[0] - np.array(e["u"]))) < 1 else new[::-1]
+        HUG_TIPS[k] = run[-1]
 
 
 def arm_shifts(edges, orders):
@@ -1921,17 +2010,28 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     top = y1 - (y1 - y0) * 0.22
     ax.add_patch(plt.Rectangle((px0, top - row * (len(order) - 0.4)), pw, row * len(order), facecolor="white",
                                edgecolor=INK, linewidth=1.2, zorder=8))
+    xd, dgap = px0 + pw * 0.40, pw * 0.02            # the legend's dash column
     for k, l in enumerate(sorted(order)):
         y = top - k * row
         ax.scatter([px0 + pw * 0.06], [y], s=24 ** 2, color=colors.get(l, "#888"), zorder=9, linewidths=0)
         ax.text(px0 + pw * 0.06, y, l, fontproperties=font(14), color="white", ha="center", va="center", zorder=10)
-        main, ext = legend_name(l, names.get(l, l))
-        if ext:
-            ax.text(px0 + pw * 0.13, y + row * 0.13, main, fontproperties=font(15), color=INK, va="center", zorder=9)
-            ax.text(px0 + pw * 0.13, y - row * 0.22, ext, fontproperties=font(10.5), color="#777", va="center",
-                    zorder=9)
-        else:
-            ax.text(px0 + pw * 0.13, y, main, fontproperties=font(15), color=INK, va="center", zorder=9)
+        t1, t2, e1, e2 = legend_name(l, names.get(l, l))
+        sub = dict(fontproperties=font(9.5), color="#777", va="center", zorder=9)
+        has_sub = bool(e1 or e2)
+        ym, ys = (y + row * 0.13, y - row * 0.22) if has_sub else (y, None)
+        if t2 is None:                               # circular line: its streets underneath
+            ax.text(px0 + pw * 0.13, ym, t1, fontproperties=font(15), color=INK, va="center", zorder=9)
+            if e1:
+                ax.text(px0 + pw * 0.13, ys, e1, ha="left", **sub)
+            continue
+        # termini in two columns round an aligned dash; variant ends under the terminus they extend beyond
+        ax.text(xd - dgap, ym, t1, fontproperties=font(15), color=INK, va="center", ha="right", zorder=9)
+        ax.text(xd, ym, "–", fontproperties=font(15), color=INK, va="center", ha="center", zorder=9)
+        ax.text(xd + dgap, ym, t2, fontproperties=font(15), color=INK, va="center", ha="left", zorder=9)
+        if e1:
+            ax.text(xd - dgap, ys, e1, ha="right", **sub)
+        if e2:
+            ax.text(xd + dgap, ys, e2, ha="left", **sub)
     # key: stop, one-way stop, extension
     ky = top - row * (len(order) - 0.4) - row * 0.8
     kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
@@ -1995,6 +2095,11 @@ def main():
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
     arm_shifts(edges, orders)
     relax_junction_corners(edges, orders)
+    rebuild_hugs(edges, orders)
+    for k, tip in HUG_TIPS.items():                 # the hairpin stop on its drawn tip
+        for s_ in stations.values():
+            if s_["name"] in HAIRPINS.values() and edges[k]["lines"] & s_["lines"]:
+                s_["xy"] = tip
     render(edges, orders, stations, json.load(open(args.config, encoding="utf-8")), args.date, args.out, shapes, line_trips)
 
 
