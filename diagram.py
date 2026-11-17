@@ -55,7 +55,7 @@ CORNER_R = 150      # m: corners become circular arcs of this radius (smaller wh
 EXACT_TURNS = True    # a lane that would fold at a tight junction corner is redrawn lane to lane (exact_turns)
 LANE_CHANGE_SIDE = False  # lane changes at a junction on the side with fewer lines (off: centred; it pushed G under E on al. Tysiąclecia)
 SPUR_RAMP_M = 300   # lane changes onto / off the Dworzec PKP spur (--station spur) ease over this length
-FIX = set()   # preview switches for the overlap fixes (user judges them): spur_east, e_bridge, l_bridge, diamonds
+FIX = {"e_bridge", "l_bridge", "diamonds"}   # preview switches for the overlap fixes (user judges them): spur_east, e_bridge, l_bridge, diamonds
 RAMP_M = 120        # a line changing lane at a junction eases over this length (no jag)
 EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension test)
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
@@ -1143,6 +1143,42 @@ def refine_orders(edges, orders, only, seed, iters=20000):
     return best
 
 
+ORDER_NEXT_TO = [("E", "B")]   # (line, neighbour): in big bundles (8+ lines) the line runs right after it
+
+
+def through_lines_east(edges, orders):
+    """A terminus on a plain street (a node with two sections, lines ending there from both sides, some passing
+    through: H at Al. Solidarności, where D / G end from the south and E / K from the north): the lines passing
+    through run on the east side of both sections, straight through, the ending lines on the west side, so they
+    read as ending there (user, 2026-11-17). Other lines keep their order."""
+    at = defaultdict(list)
+    for i, e in enumerate(edges):
+        if e["lines"] and not e.get("raw"):
+            at[e["u"]].append(i)
+            at[e["v"]].append(i)
+    n_ = 0
+    for n, es in at.items():
+        if len(es) != 2:
+            continue
+        a, b = es
+        thru = edges[a]["lines"] & edges[b]["lines"]
+        if not thru or len((edges[a]["lines"] | edges[b]["lines"]) - thru) < 2:
+            continue
+        if any(len(at.get(m, [])) == 1 for m in ()):
+            continue
+        for i in (a, b):
+            g = edges[i]["geom"]
+            p0, p1 = np.array(g.coords[0]), np.array(g.interpolate(min(60, g.length)).coords[0])
+            v = p1 - p0
+            left_east = -v[1] > 0                 # left normal (-vy, vx) points east
+            rest = [l for l in orders[i] if l not in thru]
+            th = [l for l in orders[i] if l in thru]
+            orders[i] = th + rest if left_east else rest + th
+        n_ += 1
+    if n_:
+        print(f"termini with through lines east: {n_}")
+
+
 def lane(orders, i, l):
     ls = orders[i]
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING + LANE_SHIFT.get(i, 0.0)
@@ -1999,6 +2035,8 @@ def u_turns(seq, l, edges, orders, c, E, Q):
     for (ia, fa), (ib, fb) in zip(seq, seq[1:]):
         if (edges[ia]["v"] if fa else edges[ia]["u"]) != N2:
             continue
+        if U_INFO.get("spur") and U_INFO["right"] in (ia, ib):
+            continue                  # off the spur's east leg: eased with its neighbours (A next to B, C)
         if ia in legs and edges[ib].get("u_turn_arm"):
             arm, leg, flip = ib, ia, True
         elif ib in legs and edges[ia].get("u_turn_arm"):
@@ -2632,8 +2670,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             if k is not None:
                 var_end[k].add(l)
             if "diamonds" in FIX:       # another diamond already here: this one back along its line
-                for _ in range(6):
-                    if not any(np.hypot(*(xy - q_)) < SPACING * 1.6 for q_ in diamonds_at):
+                st_xy = [spots[k][1]] if k in spots and len(stations[k]["lines"]) > 1 else []
+                for _ in range(8):     # clear of other diamonds and of the station mark
+                    if not any(np.hypot(*(xy - q_)) < SPACING * 1.6 for q_ in diamonds_at) and                             not any(np.hypot(*(xy - q_)) < SPACING * 1.3 for q_ in st_xy):
                         break
                     xy = xy - d * SPACING * 0.8
                 diamonds_at.append(xy)
@@ -2993,6 +3032,13 @@ def main():
         orders = refine_orders(edges, base_orders, near, args.seed)
     else:
         orders = best_orders(sorted(line_trips.index), edges, args.seed)
+    for i, e in enumerate(edges):       # E beside B through the Narutowicza bundle (it leaves with B; user 2026-11-17)
+        for l, nb in ORDER_NEXT_TO:
+            if len(e["lines"]) >= 8 and {l, nb} <= e["lines"]:
+                o_ = [x for x in orders[i] if x != l]
+                o_.insert(o_.index(nb) + 1, l)
+                orders[i] = o_
+    through_lines_east(edges, orders)
     arm_shifts(edges, orders)
     relax_junction_corners(edges, orders)
     rebuild_hugs(edges, orders)
