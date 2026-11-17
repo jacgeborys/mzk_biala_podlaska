@@ -139,6 +139,7 @@ Other projects are only changed for a reason and with the user's OK; their outpu
 - Feed rebuilt 2026-11-17 (validator: 0 errors, 0 warnings): Białka stops pinned to the frontage road, termini
   reached by every shape. Node-by-node check of the diagram (Twarda 1, Daleka / Wolska, Daleka / Twarda, Białka
   roundabout, Cmentarz Komunalny, Sidorska / Al. Solidarności, Al. 1000-lecia / Sidorska, Francuska, DK2 /
-  Janowska): every drawn join is the line's main relation there. GeoPackage / cartogram not rerun since (stale shapes).
+  Janowska): every drawn join is the line's main relation there. GeoPackage and both cartograms regenerated from the
+  rebuilt feed (busiest edge unchanged: 633 buses/day on the Dworzec PKP spur).
 - Next: polish the subway-style map (legend texts, stations), maybe 10-min walk variant; feed expires
   31.12.2026 — a new export will be needed for 2027.
