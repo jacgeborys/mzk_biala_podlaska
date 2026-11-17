@@ -56,13 +56,14 @@ EXT_TOL = 45        # m: shapes this close to a drawn point pass it (extension t
 EXT_MIN_M = 150     # m: shorter solid / dashed runs are merged into their neighbours
 DASH_ON, DASH_OFF = 4.0, 0.55   # extensions: dash / gap length in line widths
 EXT_SHARE = 0.25    # where a line runs with under this share of its trips of the day it is an extension (dashed)
-U_DEPTH_M = 640      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
+U_DEPTH_M = 690      # Dworzec PKP: the U hangs this far below the Sidorska / Al. 1000-lecia crossing
 U_HALF_M = 130       # ... its legs this far either side of Al. 1000-lecia (also the radius of its bottom)
 STATION_CROSS_W = 0.3   # ... crossings / lane shifts at the station (under its bar) cost this much, so they go there
 ABOVE_CROSS_W = 3.0     # ... and at the crossing above it this much (as few crossings above the station as possible)
 U_TOP_M = 300        # ... the legs first run straight down side by side this far (arms turn into them on full arcs)
-U_EASE_M = 170       # ... then move apart to their place over this length
+U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
+TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
 MIN_INTERCHANGE = 5               # stations served by this many lines get a capsule and a name
@@ -339,13 +340,14 @@ def repair_lines(edges, geoms, line_of):
     return out
 
 
-def contract_short(edges, min_len=None):
+def contract_short(edges, min_len=None, only=None, quiet=False):
     """Junction clusters joined by edges shorter than CONTRACT_M m become one junction (at their centre): lines
     then change order once, with room for the lane ramps, instead of curling over a few metres of corridor."""
     import networkx as nx
     min_len = min_len or CONTRACT_M
     G = nx.Graph()
-    G.add_edges_from((e["u"], e["v"]) for e in edges if e["geom"].length < min_len and e["u"] != e["v"])
+    G.add_edges_from((e["u"], e["v"]) for k, e in enumerate(edges)
+                     if e["geom"].length < min_len and e["u"] != e["v"] and (only is None or k in only))
     rep = {}
     for comp in nx.connected_components(G):
         c = tuple(np.round(np.array(list(comp)).mean(axis=0), 1))
@@ -359,7 +361,8 @@ def contract_short(edges, min_len=None):
         coords = list(e["geom"].coords)
         coords[0], coords[-1] = u, v
         out.append(dict(geom=LineString(coords), lines=e["lines"], u=u, v=v))
-    print(f"junction clusters merged: {len(set(rep.values()))} ({len(edges) - len(out)} short edges removed)")
+    if not quiet:
+        print(f"junction clusters merged: {len(set(rep.values()))} ({len(edges) - len(out)} short edges removed)")
     return out
 
 
@@ -412,7 +415,42 @@ def fold_parallel(edges):
     """Edges between the same two junctions with lengths within 1.5x (+50 m) of each other (two carriageways, a
     frontage road beside the main road, both approaches to a straightened roundabout) become one corridor: the
     one with more lines (then the shorter) carrying the lines of both. A detour much longer than the direct edge
-    (the Dworzec PKP spur vs Sidorska) is kept apart."""
+    (the Dworzec PKP spur vs Sidorska) is kept apart. Repeated until stable: chaining after a fold can line up
+    new pairs. Short edges closing a triangle (two similar edges from one junction to both its ends: a split that
+    rejoins 50-80 m on, e.g. at the Białka roundabout) are contracted first, which turns the triangle into a pair."""
+    total = 0
+    while True:
+        edges = collapse_triangles(edges)
+        edges, n = _fold_once(edges)
+        total += n
+        if not n:
+            break
+    if total:
+        print(f"parallel edges folded: {total}")
+    return edges
+
+
+def similar(a, b):
+    a, b = sorted((a, b))
+    return b < 1.5 * a + 50
+
+
+def collapse_triangles(edges):
+    ends = defaultdict(dict)                         # node -> {neighbour: length}
+    for e in edges:
+        if e["u"] != e["v"]:
+            ends[e["u"]][e["v"]] = ends[e["v"]][e["u"]] = e["geom"].length
+    only = set()
+    for k, e in enumerate(edges):
+        u, v = e["u"], e["v"]
+        if u == v or e["geom"].length >= TRIANGLE_M:
+            continue
+        if any(w not in (u, v) and w in ends[v] and similar(lu, ends[v][w]) for w, lu in ends[u].items()):
+            only.add(k)
+    return contract_short(edges, TRIANGLE_M, only, quiet=True) if only else edges
+
+
+def _fold_once(edges):
     by_ends = defaultdict(list)
     out = []
     for e in edges:
@@ -425,16 +463,13 @@ def fold_parallel(edges):
         es = sorted(es, key=lambda e: (-len(e["lines"]), e["geom"].length))
         keep = [es[0]]
         for e in es[1:]:
-            a_, b_ = sorted((e["geom"].length, keep[0]["geom"].length))
-            if b_ < 1.5 * a_ + 50:
+            if similar(e["geom"].length, keep[0]["geom"].length):
                 keep[0] = dict(keep[0], lines=keep[0]["lines"] | e["lines"])
                 folded += 1
             else:
                 keep.append(e)
         out += keep
-    if folded:
-        print(f"parallel edges folded: {folded}")
-    return chain_edges(out)
+    return chain_edges(out), folded
 
 
 def edge_trips(edges, geoms, n_shape, line_of):
@@ -510,18 +545,25 @@ def station_access(edges, stations):
             # smooth move outwards to the leg's place, straight down, a half circle at the bottom. Returns the points
             # and, per point, the bundle shift: at the top the two legs run side by side as one bundle continuing
             # Al. 1000-lecia (each pushed outwards by half the other's width), eased out as the legs move apart
-            ts = np.linspace(0, 1, 12)[1:]
-            ease = [P0 + dv * (U_TOP_M + U_EASE_M * t) + sign * perp * U_HALF_M * ss(t) for t in ts]
+            ease, lat = [], []
+            for a in np.linspace(0, phi, 10)[1:]:              # first arc, bending outwards
+                ease.append((U_S_R * math.sin(a), U_S_R * (1 - math.cos(a))))
+            for a in np.linspace(phi, 0, 10)[1:]:              # second arc, back to straight down
+                ease.append((2 * U_S_R * math.sin(phi) - U_S_R * math.sin(a),
+                             2 * U_S_R * (1 - math.cos(phi)) - U_S_R * (1 - math.cos(a))))
+            ease_p = [P0 + dv * (U_TOP_M + x) + sign * perp * y for x, y in ease]
             arc = [C + sign * perp * U_HALF_M * math.cos(a) + dv * U_HALF_M * math.sin(a)
                    for a in np.linspace(0, math.pi / 2, 19)]
-            prof = [sh, sh] + [sh * (1 - ss(t)) for t in ts] + [0.0] * len(arc)
-            return [tuple(p) for p in [P0, P0 + dv * U_TOP_M] + ease + arc], prof
+            prof = [sh, sh] + [sh * (1 - y / U_HALF_M) for _, y in ease] + [0.0] * len(arc)
+            return [tuple(p) for p in [P0, P0 + dv * U_TOP_M] + ease_p + arc], prof
         keep = [f for k, f in enumerate(out) if k != i]
         nL, nR = len(down), len(u_lines)
+        phi = math.acos(1 - U_HALF_M / (2 * U_S_R))                   # S-bend: two arcs, U_HALF_M sideways
+        s_len = 2 * U_S_R * math.sin(phi)                             # ... over this length
         # shift: metres left of the edge's direction (left leg: down, so west is negative; right leg: up, so east
         # is negative)
         lg, lprof = leg(-1, -nR * SPACING / 2)
-        probe = U_TOP_M + U_EASE_M                                   # headings measured where the legs are apart
+        probe = U_TOP_M + s_len                                   # headings measured where the legs are apart
         keep.append(dict(geom=LineString([N2] + lg[1:-1] + [tuple(Sx)]), lines=down, u=N2, v=key(Sx), raw=True,
                          probe_m=probe, trips=tr(down), shift_prof=lprof))
         if u_lines:
@@ -898,6 +940,55 @@ _SECTIONS = {}
 PAIRS = {}      # (line, node) -> {edge: edge}: how a line touching a node 4 times pairs its sections (the U)
 U_INFO = {}     # the Dworzec PKP U: crossing node, left / right leg edges
 NODE_W = {}     # node -> weight of crossings there (crossings under the station bar are cheap)
+
+
+def relax_junction_corners(edges, orders):
+    """Corners AT junctions too tight for the bundles turning there (an arc with room for the innermost lane needs
+    tangents of r * tan(angle / 2) on both sides, at most half of each piece): the piece's next vertex inside the
+    edge is dropped, so the piece gets longer and the arc wider (e.g. the 9-line bundle from the south-west turning
+    ~100 degrees onto Al. 1000-lecia, whose first piece was 195 m). Decided per edge, before drawing, so every
+    line of a bundle uses the same centreline and the lanes stay concentric."""
+    for i, e in enumerate(edges):
+        if i not in _SECTIONS:
+            _SECTIONS[i] = section_coords(e, len(orders[i]))
+    at = defaultdict(list)
+    for i, e in enumerate(edges):
+        if e["u"] != e["v"]:
+            at[e["u"]].append(i)
+            at[e["v"]].append(i)
+
+    def end(i, n):                                  # the section oriented to end at node n
+        c = _SECTIONS[i]
+        return c if np.hypot(*(c[-1] - np.array(n))) <= np.hypot(*(c[0] - np.array(n))) else c[::-1]
+    dropped = 0
+    for _ in range(10):
+        changed = False
+        for n, es in at.items():
+            for a in es:
+                for b in es:
+                    if a >= b or not edges[a]["lines"] & edges[b]["lines"]:
+                        continue
+                    ca, cb = end(a, n), end(b, n)[::-1]          # into n along a, out of n along b
+                    if len(ca) < 2 or len(cb) < 2:
+                        continue
+                    v1, v2 = ca[-1] - ca[-2], cb[1] - cb[0]
+                    l1, l2 = np.hypot(*v1), np.hypot(*v2)
+                    th = math.acos(float(np.clip(np.dot(v1, v2) / (l1 * l2 + 1e-9), -1, 1)))
+                    if th < math.radians(10) or th > math.radians(160):
+                        continue
+                    w = max(len(orders[a]), len(orders[b]))
+                    need = 2 * ((w - 1) / 2 * SPACING + 0.8 * SPACING) * math.tan(th / 2)
+                    for k, c_, l_ in ((a, ca, l1), (b, cb[::-1], l2)):
+                        e_ = edges[k]
+                        if l_ >= need or len(c_) < 3 or e_.get("raw") or (e_.get("split_at") or (None,))[0] == n:
+                            continue
+                        c2 = np.delete(c_, len(c_) - 2, axis=0)          # the vertex next to n
+                        _SECTIONS[k] = c2 if np.array_equal(c_[0], _SECTIONS[k][0]) else c2[::-1]
+                        dropped += 1
+                        changed = True
+        if not changed:
+            break
+    print(f"junction corners relaxed: {dropped} vertices dropped")
 
 
 def arm_shifts(edges, orders):
@@ -1302,6 +1393,7 @@ def main():
     print(f"corridor pieces {len(pieces)}, edges {len(edges)}")
     orders = best_orders(sorted(line_trips.index), edges, args.seed)
     arm_shifts(edges, orders)
+    relax_junction_corners(edges, orders)
     shapes = defaultdict(list)                   # line -> [(shape, trips of the day)], for the dashed extensions
     for sid, g in geoms.items():
         shapes[line_of[sid]].append((g, int(n_shape[sid])))
