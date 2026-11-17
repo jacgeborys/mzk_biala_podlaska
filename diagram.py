@@ -64,7 +64,8 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
-TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
+TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are terminal turning loops ...
+TURN_DUMMY_M = 220  # ... drawn as a straight dummy street this long (which lines turn in stays readable)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
 SHIFT_COST = 0.15   # order search: cost per lane a line shifts through a junction (vs 1 per crossing)
 KEY_STATIONS = {"Dworzec PKP"}   # always drawn as interchange with a name
@@ -514,24 +515,31 @@ def _fold_once(edges):
 
 def drop_turning_stubs(edges, stations):
     """Short dead-end stubs (< TURN_STUB_M) whose stop lies nearer their junction than their dead end are the
-    terminal turning manoeuvre, not a route: dropped, so the lines end on the through road at the junction and are
-    cut flush at the station capsule there (Terebelska Pętla: a 55 m stub across the end of the trunk, stop 23 m
-    from the junction). A spur with its stop out at the end (Cmentarz Komunalny, 101 m) stays."""
+    terminal turning loop (Terebelska Pętla: 55 m, stop 23 m from the junction, all six lines ending there turn
+    into it). Drawn as a dummy straight street of TURN_DUMMY_M in the stub's direction with the stop moved near
+    its end, so the lines that turn in are seen to turn and end flush at the capsule there, instead of a stub too
+    short to read. A spur with its stop out at the end (Cmentarz Komunalny, 101 m) stays as it is."""
     deg = defaultdict(int)
     for e in edges:
         deg[e["u"]] += 1
         deg[e["v"]] += 1
-    pts = [Point(s["xy"]) for s in stations.values()]
     out, n = [], 0
     for e in edges:
         if e["geom"].length < TURN_STUB_M and (deg[e["u"]] == 1) != (deg[e["v"]] == 1):
             dead, junc = (e["u"], e["v"]) if deg[e["u"]] == 1 else (e["v"], e["u"])
-            near = [p for p in pts if p.distance(e["geom"]) < 60]
-            if near and all(p.distance(Point(junc)) < p.distance(Point(dead)) for p in near):
+            near = [k for k, s_ in stations.items() if Point(s_["xy"]).distance(e["geom"]) < 60]
+            if near and all(Point(stations[k]["xy"]).distance(Point(junc)) < Point(stations[k]["xy"]).distance(Point(dead))
+                            for k in near):
+                d_ = np.array(dead) - np.array(junc)
+                d_ /= np.hypot(*d_)
+                end = tuple(np.round(np.array(junc) + d_ * TURN_DUMMY_M, 1))
+                for k in near:
+                    stations[k]["xy"] = np.array(junc) + d_ * (TURN_DUMMY_M - 25)
+                out.append(dict(geom=LineString([junc, end]), lines=e["lines"], u=junc, v=end, dummy=True))
                 n += 1
                 continue
         out.append(e)
-    print(f"terminal turning stubs dropped: {n}")
+    print(f"terminal turning loops drawn as dummy streets: {n}")
     return chain_edges(out)
 
 
