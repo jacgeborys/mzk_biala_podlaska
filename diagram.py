@@ -1028,6 +1028,31 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 best = (d, np.array(g.interpolate(g.project(Point(xy))).coords[0]))
         return None if best is None else best[1]
 
+    def drawn_tangent(l, xy):
+        """Unit tangent of line l's drawing at its point nearest xy (sign as drawn)."""
+        g = min(paths[l], key=lambda g: g.distance(Point(xy)))
+        d = g.project(Point(xy))
+        a, b = g.interpolate(max(d - 8, 0)), g.interpolate(min(d + 8, g.length))
+        v = np.array([b.x - a.x, b.y - a.y])
+        return v / max(np.hypot(*v), 1e-9)
+
+    def one_way(l, base, t):
+        """+1 / -1 if line l passes base only along / against the corridor tangent t (all its shapes of the day
+        within EXT_TOL m run that way: a loop, a one-way pair of streets), 0 if both ways."""
+        fw = bw = 0
+        zone = Point(base).buffer(EXT_TOL)
+        for g, n in shapes.get(l, []):
+            if g.distance(Point(base)) >= EXT_TOL:
+                continue
+            for part in parts(g.intersection(zone)):             # every pass (a shape may pass twice)
+                v = np.array(part.coords[-1]) - np.array(part.coords[0])
+                if np.hypot(*v) < 10:
+                    continue
+                c = float(np.dot(v / np.hypot(*v), t))
+                fw += n * (c > 0.5)
+                bw += n * (c < -0.5)
+        return 1 if fw and not bw else -1 if bw and not fw else 0
+
     # line ends: at a main terminus of the line an end bar, at the end of an extended variant a white diamond
     ends_at = defaultdict(set)                    # station -> lines whose drawing ends there
     var_end = defaultdict(set)                    # station -> lines whose extended variant ends there
@@ -1052,6 +1077,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     # names: termini only (main termini of a line with round bullets, ends of extended variants with diamond
     # bullets, and Dworzec PKP); every other stop is a dot on its lines
     requests = []                                 # labels to place
+    n_arrows = 0
     cap_r = lw * 1.3 / 2 * m_per_pt
     for sid, (i, base, t, ls) in spots.items():
         st_ = stations[sid]
@@ -1060,7 +1086,17 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         if not (st_["term"] or key_st or var_end.get(sid)):
             for l in ls:
                 p = on_line(l, base)
-                if p is not None:
+                if p is None:
+                    continue
+                w = one_way(l, base, t)
+                if w:                                    # served one way only: an arrowhead in the direction of travel
+                    td = drawn_tangent(l, p)
+                    dirv = td * w * (1 if np.dot(td, t) >= 0 else -1)
+                    ang = math.degrees(math.atan2(dirv[1], dirv[0])) - 90
+                    ax.scatter([p[0]], [p[1]], marker=(3, 0, ang), s=(lw * 1.35) ** 2, color=INK, zorder=4,
+                               linewidths=0)
+                    n_arrows += 1
+                else:
                     ax.scatter([p[0]], [p[1]], s=(lw * 0.7) ** 2, color=INK, zorder=4, linewidths=0)
             continue
         pts_ = [p for p in (on_line(l, base) for l in edges[i]["lines"]) if p is not None]
@@ -1148,6 +1184,22 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         ax.text(px0 + pw * 0.06, y, l, fontproperties=font(14), color="white", ha="center", va="center", zorder=10)
         ax.text(px0 + pw * 0.13, y, names.get(l, l).split("  ", 1)[-1], fontproperties=font(15), color=INK,
                 va="center", zorder=9)
+    # key: stop, one-way stop, extension
+    ky = top - row * (len(order) - 0.4) - row * 0.9
+    kx0, kx1 = px0 + pw * 0.02, px0 + pw * 0.10
+    key_rows = [("dot", "przystanek"), ("arrow", "przystanek w jednym kierunku jazdy"),
+                ("dash", "wydłużenia: mniej niż 1/4 kursów linii")]
+    for k, (kind, text) in enumerate(key_rows):
+        y = ky - k * row * 0.75
+        ax.plot([kx0, kx1], [y, y], color="#8a8a8a", lw=lw, solid_capstyle="butt", dash_capstyle="butt",
+                linestyle=(0, (DASH_ON, DASH_OFF)) if kind == "dash" else "-", zorder=9)
+        if kind == "dot":
+            ax.scatter([(kx0 + kx1) / 2], [y], s=(lw * 0.7) ** 2, color=INK, zorder=9.5, linewidths=0)
+        elif kind == "arrow":
+            ax.scatter([(kx0 + kx1) / 2], [y], marker=(3, 0, -90), s=(lw * 1.35) ** 2, color=INK, zorder=9.5,
+                       linewidths=0)
+        ax.text(px0 + pw * 0.13, y, text, fontproperties=font(13), color=INK, va="center", zorder=9)
+    print(f"one-way stop arrows: {n_arrows}")
     ax.text(x0 + (x1 - x0) * 0.01, y0 + (y1 - y0) * 0.012,
             "Schemat poglądowy · przebiegi linii wg rozkładu jazdy MZK Biała Podlaska na środę 18.11.2026 · "
             "podkład © OpenStreetMap contributors · opracowanie: Jacek Gęborys, 2026", fontproperties=font(10),
