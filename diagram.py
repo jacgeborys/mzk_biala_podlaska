@@ -64,6 +64,8 @@ U_TOP_M = 300        # ... the legs first run straight down side by side this fa
 U_S_R = 160          # ... then move apart to their place on an S-bend of two arcs of this radius (room for every lane)
 CONTRACT_M = 40     # junctions joined by shorter edges are merged into one
 PATH_FOLD_EDGES, PATH_FOLD_M = 4, 80   # an edge beside a path of this many edges, this close, is the same link
+PRECISE_LINES = frozenset("G")   # lines drawn along their real streets where they run alone (user, 2026-11-17)
+PRECISE_SIMPLIFY_M, PRECISE_R = 5, 35   # ... simplified this little, corners rounded this tight
 CORNER_EASE = 0.0   # a far street corner next to a too-tight junction turn is pulled this far towards its chord
 TURN_STUB_M = 120   # dead-end stubs this short with their stop by the junction are turning manoeuvres (dropped)
 TRIANGLE_M = 80     # ... and by shorter edges closing a triangle (a split rejoining right away)
@@ -962,6 +964,11 @@ def lane(orders, i, l):
     return ((len(ls) - 1) / 2 - ls.index(l)) * SPACING
 
 
+def is_precise(e):
+    """A section drawn precisely along its streets: carries only PRECISE_LINES (G where it runs alone)."""
+    return bool(e["lines"]) and e["lines"] <= PRECISE_LINES and not e.get("raw")
+
+
 def fillet(c, R):
     """Every corner of a polyline replaced by a circular arc (tangent length up to half of each leg), as in
     subway_like_map: a bundle offset from it bends as concentric arcs. Returns the points and, per point, the
@@ -979,7 +986,8 @@ def fillet(c, R):
             out.append(c[i])
             sid.append(i)
             continue
-        tl = min(R * math.tan(th / 2), seg[i - 1] * 0.5, seg[i] * 0.5)
+        Ri = R[i] if np.ndim(R) else R               # per-vertex radius (precise lines: small)
+        tl = min(Ri * math.tan(th / 2), seg[i - 1] * 0.5, seg[i] * 0.5)
         r = tl / math.tan(th / 2)
         T1, T2 = c[i] + v1 * tl, c[i] + v2 * tl
         b = (v1 + v2) / (np.linalg.norm(v1 + v2) + 1e-9)
@@ -999,6 +1007,8 @@ def section_coords(e, width):
     bundle's width (a smaller arc would fold the inner lanes) removed, as subway_like_map does."""
     if e.get("raw"):                              # drawn schematically already (Dworzec PKP)
         return np.array(e["geom"].coords)
+    if is_precise(e):                             # along its real streets: only street wiggles under 5 m go
+        return np.array(e["geom"].simplify(PRECISE_SIMPLIFY_M).coords)
     c = np.array(e["geom"].simplify(SIMPLIFY_M).coords)
     rmin = (width - 1) / 2 * SPACING + 0.8 * SPACING
     while len(c) >= 3:
@@ -1214,7 +1224,7 @@ def relax_junction_corners(edges, orders):
                         r_k = max(max(abs(lane(orders, a, l)), abs(lane(orders, b, l))) for l in shared)                             + 0.8 * SPACING
                         need = 2 * r_k * math.tan(th / 2)
                         e_ = edges[k]
-                        if l_ >= need or len(c_) < 3 or e_.get("raw") or (e_.get("split_at") or (None,))[0] == n:
+                        if l_ >= need or len(c_) < 3 or e_.get("raw") or is_precise(e_) or (e_.get("split_at") or (None,))[0] == n:
                             continue
                         v = len(c_) - 2                                    # the vertex next to n ...
                         w1, w2 = c_[v] - c_[v - 1], c_[v + 1] - c_[v]
@@ -1241,7 +1251,7 @@ def relax_junction_corners(edges, orders):
     # Narutowicza: its corner onto al. Jana Pawła II, 456 m on, drew it far away from al. Tysiąclecia)
     eased = 0
     for k, e in enumerate(edges):
-        if len(e["lines"]) != 1 or e.get("raw") or k not in _SECTIONS:
+        if len(e["lines"]) != 1 or e.get("raw") or k not in _SECTIONS or is_precise(e):
             continue
         if np.hypot(*(np.array(e["u"]) - np.array(e["v"]))) < 0.5 * e["geom"].length:
             continue                       # a loop out and back to the bundle (I via Os. Sitnickie): keep its shape
@@ -1370,7 +1380,11 @@ def draw_path(seq, l, edges, orders):
     seg_edge = np.array(seg_edge[1:] if len(seg_edge) > 1 else seg_edge)
     if len(P) < 2:
         return P, np.full(len(P), seq[0][0])
-    F, sid = fillet(P, CORNER_R)
+    # vertices inside a precise section (a line drawn along its real streets, PRECISE_LINES) get small arcs
+    ns = len(seg_edge)
+    Rv = np.array([PRECISE_R if all(is_precise(edges[seg_edge[q]]) for q in (v - 1, v) if 0 <= q < ns)
+                   else CORNER_R for v in range(len(P))])
+    F, sid = fillet(P, Rv)
     s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(F, axis=0), axis=1))])
     keep = np.concatenate([[True], np.diff(s) > 1e-6])
     F, s, sid = F[keep], s[keep], np.array(sid)[keep]
