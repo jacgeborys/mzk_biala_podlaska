@@ -1203,7 +1203,11 @@ def station_spots(stations, edges):
         cand = [i for i in cand if not stub(i, pt)] or cand
         if not cand:
             continue
-        i = min(cand, key=lambda i: geoms[i].distance(pt))
+        # a terminus sits on the section carrying most of the lines ending there (Terebelska Pętla: the trunk with
+        # I, M, D, H, G, not the short northern piece with D, H, C), else the nearest
+        dmin = min(geoms[i].distance(pt) for i in cand)        # (only as a tie-break among the nearest)
+        i = min(cand, key=lambda i: (geoms[i].distance(pt) > dmin + 5, -len(edges[i]["lines"] & s["term"]),
+                                     geoms[i].distance(pt)))
         g = geoms[i]
         d = g.project(pt)
         h = heading_at(g, d)
@@ -1371,36 +1375,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
     line_ends = []                                # (line, end point, direction pointing out of the line)
     spots = station_spots(stations, edges)
     term_cut = defaultdict(list)                  # terminus station -> points where lines ending there were cut
-    # a line ending at a terminus that comes in beside the bundle instead of along it (C at Terebelska Pętla, from
-    # Jana III Sobieskiego, passing just above the trunk) is taken into the capsule: the station line runs from the
-    # outermost lane on the other side to that line's lane, so the capsule tilts up to it; the lines ending there
-    # are cut flush along that tilted line
-    tilted = {}                                   # station -> (end a, end b, unit direction a -> b)
-    for k, (i, base, t, _) in spots.items():
-        extra = stations[k]["term"] - edges[i]["lines"]
-        if not extra:
-            continue
-        nrm = np.array([-t[1], t[0]])
-        offs = [lane(orders, i, l) for l in edges[i]["lines"]]
-        pa, pb = base + nrm * min(offs), base + nrm * max(offs)
-        mid = (min(offs) + max(offs)) / 2
-        for l in extra:
-            best = None
-            for j, e in enumerate(edges):
-                if l in e["lines"] and j in _SECTIONS and e["geom"].distance(Point(base)) < 200:
-                    g = LineString(_SECTIONS[j]).offset_curve(lane(orders, j, l))
-                    if not g.is_empty and (best is None or g.distance(Point(base)) < best[0]):
-                        best = (g.distance(Point(base)), np.array(g.interpolate(g.project(Point(base))).coords[0]))
-            if best is None or best[0] > 3 * SPACING + 60:
-                continue
-            q = best[1]
-            if float((q - base) @ nrm) >= mid:
-                pb = q
-            else:
-                pa = q
-        u = (pb - pa) / max(np.hypot(*(pb - pa)), 1e-9)
-        tilted[k] = (pa, pb, u)
-
+    shifted = {}      # terminus station -> (station point moved along the road, tip: the peak of a side line's arc)
     def trim_at_terminus(l, c, E, Q, at_end):
         """A line ending at one of its main termini is cut where it crosses the station (the line through the
         stop across the bundle), so every line ending there stops flush at the station capsule instead of
@@ -1413,7 +1388,9 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             return c, E, Q, None
         k = min(cand, key=lambda k: np.hypot(*(stations[k]["xy"] - xy)))
         _, base, t, _ = spots[k]
-        if k in tilted:                           # cut along the tilted station line instead
+        if k in shifted:                          # the station line moved to the arc's peak, level (see below)
+            base, _, t = shifted[k]
+        elif k in tilted:                         # cut along the tilted station line instead
             pa, pb, u = tilted[k]
             t2 = np.array([u[1], -u[0]])
             t, base = (t2 if t2 @ t >= 0 else -t2), (pa + pb) / 2
@@ -1441,7 +1418,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         dv_ = tip - prev
         dv_ = dv_ / max(np.hypot(*dv_), 1e-9)
         st_ = -((tip - base) @ t) / (dv_ @ t) if abs(dv_ @ t) > 0.3 else -1
-        if 0 <= st_ <= 60:
+        if 0 <= st_ <= (100 if k in shifted else 60):
             p = tip + dv_ * st_
             if abs((p - base) @ nrm) <= 4 * SPACING + 40:
                 if at_end:
@@ -1452,6 +1429,7 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
                 return c, E, Q, k
         return c, E, Q, None
 
+    chains = []                                   # (line, chain, pre, post, drawn coords, edge per point, centreline)
     for l in order:
         for seq in chain_seqs(l, edges):
             # a chain ending at a junction where the line goes on along other sections (a branch, a crossing of its
@@ -1476,6 +1454,69 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
             c, E, Q = c[mask], E[mask], Q[mask]
             if len(c) < 2:
                 continue
+            chains.append((l, seq, pre, post, c, E, Q))
+
+    # a line ending at a terminus that comes in beside the bundle instead of along it (C at Terebelska Pętla from
+    # Jana III Sobieskiego, curving north just past the trunk's end): the station line (straight across the road,
+    # so every line ending there stops at the same height) is moved along the road to the peak of that line's arc
+    # (where its curve runs parallel to the station line), and the capsule reaches out to it there
+    for k, (i, base, t, _) in spots.items():
+        extra = stations[k]["term"] - edges[i]["lines"]
+        if not extra:
+            continue
+        node = min((edges[i]["u"], edges[i]["v"]), key=lambda n: np.hypot(*(np.array(n) - base)))
+        best = None
+        for l, _, _, _, c, _, _ in chains:
+            if l not in extra:
+                continue
+            dd = np.hypot(*(c - np.array(node)).T)
+            near = np.where(dd < 3 * SPACING + 80)[0]
+            if not len(near):
+                continue
+            # the peak of its arc: the lowest point (on the page) of its bend round the junction; only where the
+            # line curves through (C at Terebelska Pętla), not where it simply ends (D at Al. Solidarności 3)
+            j = int(near[np.argmin(c[near, 1])])
+            sdj = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(c, axis=0).T))])
+            if sdj[j] < 40 or sdj[-1] - sdj[j] < 40 or j in (near.min(), near.max()):
+                continue                                         # a real dip: the line rises again either side
+            if best is None or dd[j] < best[0]:
+                best = (dd[j], c[j])
+        if best is not None:
+            apex = best[1]
+            # the station line: level on the page through the peak, so the lines ending there stop at one height
+            t_lvl = np.array([0.0, 1.0]) if t[1] >= 0 else np.array([0.0, -1.0])
+            shifted[k] = (apex.copy(), apex, t_lvl)
+
+    tilted = {}
+    for _ in [0]:
+        pass                                   # station -> (end a, end b, unit direction a -> b)
+    for k, (i, base, t, _) in spots.items():
+        extra = stations[k]["term"] - edges[i]["lines"]
+        if not extra or k in shifted:
+            continue
+        nrm = np.array([-t[1], t[0]])
+        offs = [lane(orders, i, l) for l in edges[i]["lines"]]
+        pa, pb = base + nrm * min(offs), base + nrm * max(offs)
+        mid = (min(offs) + max(offs)) / 2
+        for l in extra:
+            best = None
+            for j, e in enumerate(edges):
+                if l in e["lines"] and j in _SECTIONS and e["geom"].distance(Point(base)) < 200:
+                    g = LineString(_SECTIONS[j]).offset_curve(lane(orders, j, l))
+                    if not g.is_empty and (best is None or g.distance(Point(base)) < best[0]):
+                        best = (g.distance(Point(base)), np.array(g.interpolate(g.project(Point(base))).coords[0]))
+            if best is None or best[0] > 3 * SPACING + 60:
+                continue
+            q = best[1]
+            if float((q - base) @ nrm) >= mid:
+                pb = q
+            else:
+                pa = q
+        u = (pb - pa) / max(np.hypot(*(pb - pa)), 1e-9)
+        tilted[k] = (pa, pb, u)
+
+
+    for l, seq, pre, post, c, E, Q in chains:
             trimmed = {}
             for end_i, step in ((0, seq[0]), (-1, seq[-1])):
                 node = chain_node(step, edges, end_i == 0)
@@ -1611,9 +1652,18 @@ def render(edges, orders, stations, line_cfg, date, out, shapes, line_trips):
         side = [float(np.dot(p - base, nrm)) for p in pts_]
         lo, hi = min(side) - SPACING * 0.55, max(side) + SPACING * 0.55
         a_, b_ = base + nrm * lo, base + nrm * hi
-        if sid in tilted:                             # capsule along the tilted station line (see above)
+        if sid in tilted:                             # capsule along the tilted station line
             pa, pb, u_ = tilted[sid]
             a_, b_ = pa - u_ * SPACING * 0.55, pb + u_ * SPACING * 0.55
+        if sid in shifted:                            # moved station line: from the lines cut there to the arc's peak
+            b2, apex, t2 = shifted[sid]
+            nrm = np.array([-t2[1], t2[0]])
+            sd2 = [float((p - b2) @ nrm) for p in term_cut.get(sid, [])] or [0.0]
+            sa = float((apex - b2) @ nrm)
+            far = max(sd2, key=lambda v: abs(v - sa))        # the lane farthest from the peak, padded outwards
+            far += SPACING * 0.55 * (1 if far > sa else -1)
+            a_, b_ = b2 + nrm * far, b2 + nrm * sa
+            base = b2
         if not any(n_ == base_name(st_["name"]) and np.hypot(*(q_ - base)) < 150 for n_, q_ in capsuled):
             capsuled.add((base_name(st_["name"]), tuple(base)))
             capsule(a_, b_)
